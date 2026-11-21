@@ -8095,6 +8095,161 @@ fn test_set_alert_tags_rejects_empty_or_overlong_tag() {
     assert_eq!(result, Err(Ok(ContractError::InvalidTag)));
 }
 
+// ── #605: alert.snooze / alert.tags / alert.renew carry the caller ─────────
+
+#[test]
+fn test_snooze_alert_event_carries_schema_version_and_caller() {
+    use soroban_sdk::{symbol_short, testutils::Events as _};
+
+    let (env, _admin, client) = setup();
+    let owner = Address::generate(&env);
+    let target = Address::generate(&env);
+    env.ledger().with_mut(|li| li.sequence_number = 100);
+    let id = client.register_alert(
+        &owner,
+        &target,
+        &str(&env, "Alert"),
+        &hash64(&env),
+        &vec![&env, str(&env, "rule:transfer")],
+    );
+
+    client.snooze_alert(&owner, &id, &200);
+
+    let event = env
+        .events()
+        .all()
+        .iter()
+        .find(|(_, topics, _)| {
+            topics.len() == 2
+                && Symbol::from_val(&env, &topics.get(0).unwrap()) == symbol_short!("alert")
+                && Symbol::from_val(&env, &topics.get(1).unwrap()) == symbol_short!("snooze")
+        })
+        .expect("alert.snooze event must be emitted");
+    let (_, _, data) = event;
+    let (version, emitted_id, emitted_caller, emitted_until): (u32, u64, Address, u32) =
+        soroban_sdk::FromVal::from_val(&env, &data);
+    assert_eq!(version, EVENT_SCHEMA_VERSION);
+    assert_eq!(emitted_id, id);
+    assert_eq!(emitted_caller, owner);
+    assert_eq!(emitted_until, 200u32);
+}
+
+#[test]
+fn test_set_alert_tags_event_carries_schema_version_and_caller() {
+    use soroban_sdk::{symbol_short, testutils::Events as _};
+
+    let (env, _admin, client) = setup();
+    let owner = Address::generate(&env);
+    let target = Address::generate(&env);
+    let id = client.register_alert(
+        &owner,
+        &target,
+        &str(&env, "Alert"),
+        &hash64(&env),
+        &vec![&env, str(&env, "rule:transfer")],
+    );
+
+    let tags = vec![&env, str(&env, "prod"), str(&env, "treasury")];
+    client.set_alert_tags(&owner, &id, &tags);
+
+    let event = env
+        .events()
+        .all()
+        .iter()
+        .find(|(_, topics, _)| {
+            topics.len() == 2
+                && Symbol::from_val(&env, &topics.get(0).unwrap()) == symbol_short!("alert")
+                && Symbol::from_val(&env, &topics.get(1).unwrap()) == symbol_short!("tags")
+        })
+        .expect("alert.tags event must be emitted");
+    let (_, _, data) = event;
+    let (version, emitted_id, emitted_caller, emitted_count): (u32, u64, Address, u32) =
+        soroban_sdk::FromVal::from_val(&env, &data);
+    assert_eq!(version, EVENT_SCHEMA_VERSION);
+    assert_eq!(emitted_id, id);
+    assert_eq!(emitted_caller, owner);
+    assert_eq!(emitted_count, 2u32);
+}
+
+#[test]
+fn test_renew_alert_ttl_for_event_carries_requested_ttl() {
+    use soroban_sdk::{symbol_short, testutils::Events as _};
+
+    let (env, _admin, client) = setup();
+    let owner = Address::generate(&env);
+    let target = Address::generate(&env);
+    env.ledger().with_mut(|li| li.sequence_number = 100);
+    let id = client.register_alert(
+        &owner,
+        &target,
+        &str(&env, "Alert"),
+        &hash64(&env),
+        &vec![&env, str(&env, "rule:transfer")],
+    );
+
+    let requested_ttl = 500u32;
+    client.renew_alert_ttl_for(&owner, &id, &requested_ttl);
+
+    let event = env
+        .events()
+        .all()
+        .iter()
+        .find(|(_, topics, _)| {
+            topics.len() == 2
+                && Symbol::from_val(&env, &topics.get(0).unwrap()) == symbol_short!("alert")
+                && Symbol::from_val(&env, &topics.get(1).unwrap()) == symbol_short!("renew")
+        })
+        .expect("alert.renew event must be emitted");
+    let (_, _, data) = event;
+    let (version, emitted_id, emitted_caller, emitted_ttl): (u32, u64, Address, u32) =
+        soroban_sdk::FromVal::from_val(&env, &data);
+    assert_eq!(version, EVENT_SCHEMA_VERSION);
+    assert_eq!(emitted_id, id);
+    assert_eq!(emitted_caller, owner);
+    assert_eq!(
+        emitted_ttl, requested_ttl,
+        "renew_alert_ttl_for must emit the requested TTL, not the default"
+    );
+}
+
+#[test]
+fn test_renew_alert_ttl_event_carries_requested_ttl() {
+    use soroban_sdk::{symbol_short, testutils::Events as _};
+
+    let (env, _admin, client) = setup();
+    let owner = Address::generate(&env);
+    let target = Address::generate(&env);
+    env.ledger().with_mut(|li| li.sequence_number = 100);
+    let id = client.register_alert(
+        &owner,
+        &target,
+        &str(&env, "Alert"),
+        &hash64(&env),
+        &vec![&env, str(&env, "rule:transfer")],
+    );
+
+    let requested_ttl = 250u32;
+    client.renew_alert_ttl(&owner, &id, &requested_ttl);
+
+    let event = env
+        .events()
+        .all()
+        .iter()
+        .find(|(_, topics, _)| {
+            topics.len() == 2
+                && Symbol::from_val(&env, &topics.get(0).unwrap()) == symbol_short!("alert")
+                && Symbol::from_val(&env, &topics.get(1).unwrap()) == symbol_short!("renew")
+        })
+        .expect("alert.renew event must be emitted");
+    let (_, _, data) = event;
+    let (version, emitted_id, emitted_caller, emitted_ttl): (u32, u64, Address, u32) =
+        soroban_sdk::FromVal::from_val(&env, &data);
+    assert_eq!(version, EVENT_SCHEMA_VERSION);
+    assert_eq!(emitted_id, id);
+    assert_eq!(emitted_caller, owner);
+    assert_eq!(emitted_ttl, requested_ttl);
+}
+
 // ── #396: snooze-until-ledger for alerts ────────────────────────────────────
 
 #[test]

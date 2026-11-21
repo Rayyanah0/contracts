@@ -2281,6 +2281,33 @@ mod tests {
         assert_eq!(client.get_pending_admin_transfer(), None);
     }
 
+    /// Regression test for #590 — the getter must decode the stored
+    /// `(proposer, new_admin, expires_at_ledger)` triple and return the
+    /// proposed `new_admin` while the proposal is live.
+    #[test]
+    fn test_get_pending_admin_transfer_with_pending_proposal() {
+        let (env, admin, client) = setup();
+        let new_admin = Address::generate(&env);
+
+        client.propose_admin_transfer(&admin, &new_admin);
+        assert_eq!(client.get_pending_admin_transfer(), Some(new_admin));
+    }
+
+    /// Regression test for #590 — an expired proposal is reported as `None`
+    /// even though it is still stored (matching AlertRegistry's behaviour).
+    #[test]
+    fn test_get_pending_admin_transfer_expired_returns_none() {
+        let (env, admin, client) = setup();
+        let new_admin = Address::generate(&env);
+
+        client.propose_admin_transfer(&admin, &new_admin);
+        assert_eq!(client.get_pending_admin_transfer(), Some(new_admin));
+
+        env.ledger()
+            .set_sequence_number(env.ledger().sequence() + ADMIN_TRANSFER_EXPIRY_LEDGERS + 1);
+        assert_eq!(client.get_pending_admin_transfer(), None);
+    }
+
     // 15g. non-admin cannot propose or cancel an admin transfer
     #[test]
     fn test_propose_and_cancel_admin_transfer_unauthorized() {

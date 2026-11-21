@@ -363,9 +363,104 @@ Emitted when an alert's TTL is renewed via `renew_alert_ttl`.
 |---|---|
 | Topic 0 | `Symbol("alert")` |
 | Topic 1 | `Symbol("renew")` |
-| Data | `(id: u64, owner: Address)` |
+| Data | `(id: u64, caller: Address, ttl: u32)` |
+
+> `caller` is the address that paid for the renewal (the owner or an
+> authorised renewer), and `ttl` is the effective TTL after clamping to
+> `MAX_TTL`.
 
 **Status:** ✅ implemented (`renew_alert_ttl`)
+
+---
+
+### `alert.snooze`
+
+Emitted when an alert is snoozed via `snooze_alert`, suppressing notifications
+until the snooze period elapses.
+
+| Field | Value |
+|---|---|
+| Topic 0 | `Symbol("alert")` |
+| Topic 1 | `Symbol("snooze")` |
+| Data | `(id: u64, caller: Address, until_ledger: u32)` |
+
+> `caller` is the address that requested the snooze, and `until_ledger` is the
+> ledger sequence at which the alert resumes notifying. Indexers can use this
+> to suppress notifications locally without re-fetching the alert.
+
+**Status:** ✅ implemented (`snooze_alert`)
+
+---
+
+### `alert.tags`
+
+Emitted when an alert's tags are replaced via `set_alert_tags`.
+
+| Field | Value |
+|---|---|
+| Topic 0 | `Symbol("alert")` |
+| Topic 1 | `Symbol("tags")` |
+| Data | `(id: u64, caller: Address, tags: Vec<String>)` |
+
+> `caller` is the address that changed the tags. The full new tag list is
+> carried so an indexer can update its view without a follow-up `get_alert`.
+
+**Status:** ✅ implemented (`set_alert_tags`)
+
+---
+
+### `alert.rm_all`
+
+Emitted once per call to `remove_all_alerts` when at least one of the caller's
+alerts was removed. Carries the total affected count rather than one event per
+alert, keeping the bulk operation's footprint constant.
+
+| Field | Value |
+|---|---|
+| Topic 0 | `Symbol("alert")` |
+| Topic 1 | `Symbol("rm_all")` |
+| Data | `(caller: Address, count: u32)` |
+
+> No event is emitted if `count` is `0` (e.g. the caller has no alerts).
+
+**Status:** ✅ implemented (`remove_all_alerts`)
+
+---
+
+### `alert.expiry`
+
+Emitted when an alert's expiry ledger is set or changed via `set_alert_expiry`.
+
+| Field | Value |
+|---|---|
+| Topic 0 | `Symbol("alert")` |
+| Topic 1 | `Symbol("expiry")` |
+| Data | `(id: u64, caller: Address, expires_at_ledger: u32)` |
+
+> `expires_at_ledger` is the ledger sequence at or after which the alert is
+> considered expired. Indexers can use this event to schedule local purges
+> instead of polling `get_alert`.
+
+**Status:** ✅ implemented (`set_alert_expiry`)
+
+---
+
+### `schema.migrate`
+
+Emitted when the contract's storage schema is migrated to a new version via
+`schema_migrate`.
+
+| Field | Value |
+|---|---|
+| Topic 0 | `Symbol("schema")` |
+| Topic 1 | `Symbol("migrate")` |
+| Data | `(caller: Address, from_version: u32, to_version: u32)` |
+
+> `caller` is the admin that triggered the migration. Indexers should treat a
+> change in `to_version` as a signal that stored records may have been
+> rewritten and re-read any cached state.
+
+**Status:** ✅ implemented (`schema_migrate`)
 
 ---
 
@@ -572,6 +667,44 @@ Emitted when a watcher address is de-authorised.
 > `old_watcher`. A listener that reacts to both event types will see the old
 > watcher's revocation twice — see
 > [`watcher.replace`](#watcherreplace) for how to de-duplicate.
+
+---
+
+### `watcher.info`
+
+Emitted when a watcher's metadata (e.g. its endpoint or description) is
+updated via `set_watcher_info`.
+
+| Field | Value |
+|---|---|
+| Topic 0 | `Symbol("watcher")` |
+| Topic 1 | `Symbol("info")` |
+| Data | `(watcher: Address, caller: Address)` |
+
+> The new metadata is intentionally omitted from the event data — it is
+> already stored on-chain and can be read via `get_watcher_info`. Omitting it
+> keeps the payload small.
+
+**Status:** ✅ implemented (`set_watcher_info`)
+
+---
+
+### `watcher.scope`
+
+Emitted when a watcher's authorised scope is changed via `set_watcher_scope`.
+
+| Field | Value |
+|---|---|
+| Topic 0 | `Symbol("watcher")` |
+| Topic 1 | `Symbol("scope")` |
+| Data | `(watcher: Address, caller: Address, scope: Vec<Address>)` |
+
+> `scope` is the full new set of contracts the watcher is authorised to
+> monitor. An empty vector means the watcher is unscoped (authorised for all
+> contracts). Indexers gating on watcher trust should re-evaluate the watcher
+> against this list.
+
+**Status:** ✅ implemented (`set_watcher_scope`)
 
 ---
 

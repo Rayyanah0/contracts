@@ -97,7 +97,7 @@ pub const MAX_PAGE_SIZE: u32 = 100;
 /// this value instead of guessing the shape from the payload length. See
 /// `docs/events.md` for the versioning policy and which events currently
 /// carry this marker.
-pub const EVENT_SCHEMA_VERSION: u32 = 2;
+pub const EVENT_SCHEMA_VERSION: u32 = 3;
 
 /// Recognized rule descriptors accepted by [`AlertRegistry::validate_rule`].
 pub const VALID_RULE_DESCRIPTORS: [&str; 5] = [
@@ -2817,7 +2817,8 @@ impl AlertRegistry {
     ///
     /// # Events
     /// Emits `(Symbol("alert"), Symbol("tags"))` with data
-    /// `(id: u64, count: u32)`.
+    /// `(version: u32, id: u64, caller: Address, count: u32)`, where `version`
+    /// is [`EVENT_SCHEMA_VERSION`] (#605).
     pub fn set_alert_tags(
         env: Env,
         caller: Address,
@@ -2852,7 +2853,7 @@ impl AlertRegistry {
 
         env.events().publish(
             (symbol_short!("alert"), symbol_short!("tags")),
-            (config_id, tags.len() as u32),
+            (EVENT_SCHEMA_VERSION, config_id, caller, tags.len() as u32),
         );
 
         Ok(())
@@ -2889,7 +2890,8 @@ impl AlertRegistry {
     ///
     /// # Events
     /// Emits `(Symbol("alert"), Symbol("snooze"))` with data
-    /// `(id: u64, until_ledger: u32)`.
+    /// `(version: u32, id: u64, caller: Address, until_ledger: u32)`, where
+    /// `version` is [`EVENT_SCHEMA_VERSION`] (#605).
     pub fn snooze_alert(
         env: Env,
         caller: Address,
@@ -2918,7 +2920,7 @@ impl AlertRegistry {
 
         env.events().publish(
             (symbol_short!("alert"), symbol_short!("snooze")),
-            (config_id, until_ledger),
+            (EVENT_SCHEMA_VERSION, config_id, caller, until_ledger),
         );
 
         Ok(())
