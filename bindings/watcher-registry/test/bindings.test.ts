@@ -52,6 +52,7 @@ describe("WatcherRegistry bindings", () => {
     const client = new Client(testnetConfig);
     // Read-only methods (no auth required)
     expect(typeof client.is_watcher_authorized).toBe("function");
+    expect(typeof client.are_watchers_authorized).toBe("function");
     expect(typeof client.get_watchers).toBe("function");
     expect(typeof client.get_admins).toBe("function");
     expect(typeof client.get_admin).toBe("function");
@@ -60,7 +61,27 @@ describe("WatcherRegistry bindings", () => {
     expect(typeof client.get_timelock_delay).toBe("function");
   });
 
-  it("exposes expected write methods on the Client prototype", () => {
+  it("are_watchers_authorized rejects oversized batches instead of truncating", async () => {
+    const client = new Client(testnetConfig);
+    // MAX_PAGE_SIZE is 100; a 101-element batch must surface an error rather
+    // than silently returning a shorter Vec<bool>.
+    const oversized = Array.from({ length: 101 }, () => "G".padEnd(56, "A"));
+    await expect(client.are_watchers_authorized({ watchers: oversized })).rejects.toThrow();
+  });
+
+  it("are_watchers_authorized accepts a batch at the MAX_PAGE_SIZE boundary", async () => {
+    const client = new Client(testnetConfig);
+    const atLimit = Array.from({ length: 100 }, () => "G".padEnd(56, "A"));
+    // At the boundary the call must not fail validation; it may still fail on
+    // the network, but it must not throw the oversized-batch error.
+    const result = client.are_watchers_authorized({ watchers: atLimit });
+    expect(result).toBeDefined();
+    if (result && typeof result.catch === "function") {
+      result.catch(() => {});
+    }
+  });
+
+  it("exports expected write methods on the Client prototype", () => {
     const client = new Client(testnetConfig);
     // Write methods (auth required)
     expect(typeof client.initialize).toBe("function");

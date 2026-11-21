@@ -69,6 +69,12 @@ pub enum ContractError {
     /// Returned by `remove_admin` when `target_admin` is not currently an
     /// admin, so there is nothing to remove.
     AdminNotFound = 17,
+    /// Returned by batch query entry points such as
+    /// [`WatcherRegistry::are_watchers_authorized`] when the input holds more
+    /// than [`MAX_PAGE_SIZE`] addresses. Rejecting the whole batch (rather
+    /// than truncating it) keeps the returned `Vec<bool>` aligned with the
+    /// input so callers can zip the two safely.
+    BatchTooLarge = 18,
 }
 
 // ── TTL constants ────────────────────────────────────────────────────────────
@@ -1418,7 +1424,15 @@ impl WatcherRegistry {
 
         env.events().publish(
             (symbol_short!("admin"), symbol_short!("propose")),
-            (caller, ready_at),
+            (caller.clone(), ready_at),
+        );
+
+        // Also publish the queued action itself under a distinct topic so
+        // co-admins monitoring events can tell an `Upgrade(hash)` from a
+        // `TransferAdmin(addr)` without calling `get_pending_action`.
+        env.events().publish(
+            (symbol_short!("admin"), symbol_short!("queue")),
+            (caller, ready_at, pending.action),
         );
 
         Ok(ready_at)
@@ -1881,12 +1895,12 @@ mod tests {
         let new_watcher = Address::generate(&env);
         client.register_watcher(&admin, &old_watcher);
         client.replace_watcher(&admin, &old_watcher, &new_watcher);
-        let replaced: (Address, Address) = assert_last_event_data(
+        let replaced: (Address, Address, Vec<Address>) = assert_last_event_data(
             &env,
             soroban_sdk::symbol_short!("watcher"),
             soroban_sdk::symbol_short!("replace"),
         );
-        assert_eq!(replaced, (old_watcher, new_watcher));
+        assert_eq!(replaced, (old_watcher, new_watcher, vec![&env]));
 
         client.pause(&admin);
         let paused: (Address,) = assert_last_event_data(
@@ -3648,6 +3662,126 @@ mod tests {
 
         assert_eq!(env.events().all().events().len(), 2);
         assert_eq!(env.events().all().len(), 2);
+    }
+
+    // 31a. replace_watcher carries metadata and scope to the new address.
+    #[test]
+    fn test_replace_watcher_carries_info_and_scope() {
+        let (env, admin, client) = setup();
+        let old_watcher = Address::generate(&env);
+        let new_watcher = Address::generate(&env);
+        let target = Address::generate(&env);
+
+        client.register_watcher(&admin, &old_watcher);
+        client.set_watcher_info(
+            &admin,
+            &old_watcher,
+            &Some(WatcherInfo {
+                label: String::from_str(&env, "node-a"),
+                operator: String::from_str(&env, "ops"),
+            }),
+        );
+        client.set_watcher_scope(&admin, &old_watcher, &vec![&env, target.clone()]);
+
+        client.replace_watcher(&admin, &old_watcher, &new_watcher);
+
+        // Metadata moved to the new address and cleared from the old one.
+        let info = client.get_watcher_info(&new_watcher).unwrap();
+        assert_eq!(info.label, String::from_str(&env, "node-a"));
+        assert_eq!(info.operator, String::from_str(&env, "ops"));
+        assert!(client.get_watcher_info(&old_watcher).is_none());
+
+        // Scope moved too: the new watcher is restricted to `target`, so it
+        // is not authorized for an unrelated target.
+        let other = Address::generate(&env);
+        assert!(client.is_watcher_authorized_for(&new_watcher, &target));
+        assert!(!client.is_watcher_authorized_for(&new_watcher, &other));
+
+        // The replace event carries the scope.
+        let replaced: (Address, Address, Vec<Address>) = assert_last_event_data(
+            &env,
+            soroban_sdk::symbol_short!("watcher"),
+            soroban_sdk::symbol_short!("replace"),
+        );
+        assert_eq!(replaced, (old_watcher, new_watcher, vec![&env, target]));
+    }
+
+    // 31b. Clearing watcher info emits a watcher.info event.
+    #[test]
+    fn test_set_watcher_info_none_emits_event() {
+        let (env, admin, client) = setup();
+        let watcher = Address::generate(&env);
+
+        client.register_watcher(&admin, &watcher);
+        client.set_watcher_info(
+            &admin,
+            &watcher,
+            &Some(WatcherInfo {
+                label: String::from_str(&env, "node-a"),
+                operator: String::from_str(&env, "ops"),
+            }),
+        );
+        client.set_watcher_info(&admin, &watcher, &None);
+
+        assert!(client.get_watcher_info(&watcher).is_none());
+        let cleared: Option<WatcherInfo> = assert_last_event_data(
+            &env,
+            soroban_sdk::symbol_short!("watcher"),
+            soroban_sdk::symbol_short!("info"),
+        );
+        assert!(cleared.is_none());
+    }
+
+    // 31c. propose_admin_action emits admin.queue with the queued action.
+    #[test]
+    fn test_propose_admin_action_emits_queue_event() {
+        let (env, admin, client) = setup();
+        let new_admin = Address::generate(&env);
+
+        client.set_timelock_delay(&admin, &TEST_DELAY);
+        let ready_at = client.propose_admin_action(
+            &admin,
+            &AdminAction::TransferAdmin(new_admin.clone()),
+        );
+
+        let queued: (Address, u32, AdminAction) = assert_last_event_data(
+            &env,
+            soroban_sdk::symbol_short!("admin"),
+            soroban_sdk::symbol_short!("queue"),
+        );
+        assert_eq!(
+            queued,
+            (admin, ready_at, AdminAction::TransferAdmin(new_admin))
+        );
+    }
+
+    // 31d. are_watchers_authorized rejects oversized batches instead of
+    // truncating them.
+    #[test]
+    fn test_are_watchers_authorized_rejects_oversized_batch() {
+        let (env, admin, client) = setup();
+        let watcher = Address::generate(&env);
+        client.register_watcher(&admin, &watcher);
+
+        let mut batch: Vec<Address> = vec![&env];
+        for _ in 0..=MAX_PAGE_SIZE {
+            batch.push_back(Address::generate(&env));
+        }
+        assert_eq!(
+            client
+                .try_are_watchers_authorized(&batch)
+                .unwrap_err()
+                .unwrap(),
+            ContractError::BatchTooLarge
+        );
+
+        // Exactly MAX_PAGE_SIZE is accepted and stays aligned with the input.
+        let mut boundary: Vec<Address> = vec![&env];
+        for _ in 0..MAX_PAGE_SIZE {
+            boundary.push_back(Address::generate(&env));
+        }
+        let results = client.are_watchers_authorized(&boundary);
+        assert_eq!(results.len(), boundary.len());
     }
 
     // 31. self-replace (old == new) is a no-op — no spurious watcher.remove

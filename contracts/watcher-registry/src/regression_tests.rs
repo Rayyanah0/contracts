@@ -345,6 +345,188 @@ fn test_are_watchers_authorized_batch_query() {
         client.are_watchers_authorized(&oversized).len() as u32,
         MAX_PAGE_SIZE
     );
+}
+
+/// Regression test for #595: `replace_watcher` must carry the old watcher's
+/// `WatcherInfo` and `WatcherScope` to the new address (and clear them from
+/// the old one), so key rotation does not silently widen access.
+#[test]
+fn test_regression_replace_watcher_carries_info_and_scope() {
+    let (env, admin, client) = setup();
+    let old_watcher = Address::generate(&env);
+    let new_watcher = Address::generate(&env);
+    let target_a = Address::generate(&env);
+    let target_b = Address::generate(&env);
+
+    client.register_watcher(&admin, &old_watcher);
+    let info = WatcherInfo {
+        label: String::from_str(&env, "keeper-east"),
+        operator: String::from_str(&env, "Acme Monitoring"),
+    };
+    client.set_watcher_info(&admin, &old_watcher, &Some(info.clone()));
+    let scope = soroban_sdk::vec![&env, target_a.clone()];
+    client.set_watcher_scope(&admin, &old_watcher, &scope);
+
+    client.replace_watcher(&admin, &old_watcher, &new_watcher);
+
+    // Metadata and scope moved to the new address.
+    assert_eq!(client.get_watcher_info(&new_watcher), Some(info));
+    assert_eq!(client.get_watcher_scope(&new_watcher), scope);
+    assert!(client.is_watcher_authorized_for(&new_watcher, &target_a));
+    assert!(!client.is_watcher_authorized_for(&new_watcher, &target_b));
+
+    // Old address no longer holds metadata or scope.
+    assert!(client.get_watcher_info(&old_watcher).is_none());
+    assert!(client.get_watcher_scope(&old_watcher).is_empty());
+
+    // The `watcher.replace` event carries the scope.
+    let events = env.events().all();
+    let events = events.events();
+    let mut found = false;
+    for i in 0..events.len() {
+        let (_, topics, data) = events.get(i).unwrap();
+        if topics.len() == 2
+            && soroban_sdk::Symbol::from_val(&env, &topics.get(0).unwrap())
+                == soroban_sdk::symbol_short!("watcher")
+            && soroban_sdk::Symbol::from_val(&env, &topics.get(1).unwrap())
+                == soroban_sdk::symbol_short!("replace")
+        {
+            let (old, new, emitted_scope): (Address, Address, Vec<Address>) =
+                soroban_sdk::FromVal::from_val(&env, &data);
+            assert_eq!(old, old_watcher);
+            assert_eq!(new, new_watcher);
+            assert_eq!(emitted_scope, scope);
+            found = true;
+        }
+    }
+    assert!(found, "watcher.replace event must be emitted");
+}
+
+/// Regression test for #596: clearing watcher metadata with `None` must emit
+/// a `watcher.info` event (with an empty payload) so indexers drop stale data.
+#[test]
+fn test_regression_set_watcher_info_none_emits_event() {
+    let (env, admin, client) = setup();
+    let watcher = Address::generate(&env);
+    client.register_watcher(&admin, &watcher);
+
+    let info = WatcherInfo {
+        label: String::from_str(&env, "keeper-east"),
+        operator: String::from_str(&env, "Acme Monitoring"),
+    };
+    client.set_watcher_info(&admin, &watcher, &Some(info));
+
+    client.set_watcher_info(&admin, &watcher, &None);
+    assert!(client.get_watcher_info(&watcher).is_none());
+
+    let events = env.events().all();
+    let events = events.events();
+    let mut found = false;
+    for i in 0..events.len() {
+        let (_, topics, data) = events.get(i).unwrap();
+        if topics.len() == 2
+            && soroban_sdk::Symbol::from_val(&env, &topics.get(0).unwrap())
+                == soroban_sdk::symbol_short!("watcher")
+            && soroban_sdk::Symbol::from_val(&env, &topics.get(1).unwrap())
+                == soroban_sdk::symbol_short!("info")
+        {
+            let (emitted_watcher, emitted_info): (Address, Option<WatcherInfo>) =
+                soroban_sdk::FromVal::from_val(&env, &data);
+            assert_eq!(emitted_watcher, watcher);
+            assert!(emitted_info.is_none());
+            found = true;
+        }
+    }
+    assert!(found, "watcher.info event must be emitted when clearing info");
+}
+
+/// Regression test for #598: `propose_admin_action` must emit an `admin.queue`
+/// event carrying the queued `AdminAction` so co-admins can monitor the
+/// timelock window without calling `get_pending_action`.
+#[test]
+fn test_regression_propose_admin_action_emits_queued_action() {
+    let (env, admin, client) = setup();
+    let new_admin = Address::generate(&env);
+
+    // Upgrade(hash)
+    let hash = soroban_sdk::BytesN::from_array(&env, &[7u8; 32]);
+    client.propose_admin_action(&admin, &AdminAction::Upgrade(hash.clone()));
+    let events = env.events().all();
+    let events = events.events();
+    let mut found = false;
+    for i in 0..events.len() {
+        let (_, topics, data) = events.get(i).unwrap();
+        if topics.len() == 2
+            && soroban_sdk::Symbol::from_val(&env, &topics.get(0).unwrap())
+                == soroban_sdk::symbol_short!("admin")
+            && soroban_sdk::Symbol::from_val(&env, &topics.get(1).unwrap())
+                == soroban_sdk::symbol_short!("queue")
+        {
+            let (caller, _ready_at, action): (Address, u32, AdminAction) =
+                soroban_sdk::FromVal::from_val(&env, &data);
+            assert_eq!(caller, admin);
+            assert_eq!(action, AdminAction::Upgrade(hash.clone()));
+            found = true;
+        }
+    }
+    assert!(found, "admin.queue event must be emitted for Upgrade");
+
+    // TransferAdmin(addr)
+    client.cancel_admin_action(&admin);
+    client.propose_admin_action(&admin, &AdminAction::TransferAdmin(new_admin.clone()));
+    let events = env.events().all();
+    let events = events.events();
+    let mut found = false;
+    for i in 0..events.len() {
+        let (_, topics, data) = events.get(i).unwrap();
+        if topics.len() == 2
+            && soroban_sdk::Symbol::from_val(&env, &topics.get(0).unwrap())
+                == soroban_sdk::symbol_short!("admin")
+            && soroban_sdk::Symbol::from_val(&env, &topics.get(1).unwrap())
+                == soroban_sdk::symbol_short!("queue")
+        {
+            let (caller, _ready_at, action): (Address, u32, AdminAction) =
+                soroban_sdk::FromVal::from_val(&env, &data);
+            assert_eq!(caller, admin);
+            assert_eq!(action, AdminAction::TransferAdmin(new_admin.clone()));
+            found = true;
+        }
+    }
+    assert!(found, "admin.queue event must be emitted for TransferAdmin");
+}
+
+/// Regression test for #599: `are_watchers_authorized` accepts exactly
+/// `MAX_PAGE_SIZE` entries and errors on larger batches instead of silently
+/// truncating the result.
+#[test]
+fn test_regression_are_watchers_authorized_oversized_batch_errors() {
+    let (env, admin, client) = setup();
+    let w1 = Address::generate(&env);
+    client.register_watcher(&admin, &w1);
+
+    // Exactly MAX_PAGE_SIZE is accepted.
+    let mut at_limit: Vec<Address> = soroban_sdk::vec![&env];
+    for _ in 0..MAX_PAGE_SIZE {
+        at_limit.push_back(w1.clone());
+    }
+    let result = client.are_watchers_authorized(&at_limit);
+    assert_eq!(result.len() as u32, MAX_PAGE_SIZE);
+    for i in 0..result.len() {
+        assert!(result.get(i).unwrap());
+    }
+
+    // One past the limit is rejected.
+    let mut over_limit: Vec<Address> = soroban_sdk::vec![&env];
+    for _ in 0..(MAX_PAGE_SIZE + 1) {
+        over_limit.push_back(w1.clone());
+    }
+    assert_eq!(
+        client
+            .try_are_watchers_authorized(&over_limit)
+            .unwrap_err()
+            .unwrap(),
+        ContractError::BatchTooLarge
+    );
 /// Regression test for #403: `remove_admin` on an address that is not an
 /// admin must return `ContractError::AdminNotFound` and must not rewrite the
 /// admin set or emit an `admin.remove` event.
