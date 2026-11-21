@@ -69,6 +69,9 @@ pub enum ContractError {
     /// Returned by `remove_admin` when `target_admin` is not currently an
     /// admin, so there is nothing to remove.
     AdminNotFound = 17,
+    /// Returned by [`WatcherRegistry::get_guardian`] when no guardian has
+    /// been configured via [`WatcherRegistry::set_guardian`].
+    GuardianNotSet = 18,
 }
 
 // ── TTL constants ────────────────────────────────────────────────────────────
@@ -144,6 +147,9 @@ pub enum DataKey {
     /// watcher is scoped to. Absent, or present but empty, means
     /// unrestricted (authorized for every target).
     WatcherScope(Address),
+    /// Stores the optional guardian [`Address`] allowed to trip
+    /// [`WatcherRegistry::pause`] without holding a full admin key.
+    Guardian,
 }
 
 /// Optional off-chain-identifying metadata for a registered watcher.
@@ -171,9 +177,8 @@ pub enum AdminAction {
     AddAdmin(Address),
     /// Replace the entire admin set with the given address.
     TransferAdmin(Address),
-    /// Deauthorize every registered watcher.
-    ClearAllWatchers,
-    /// Change the timelock delay (in ledgers).
+    /// Change the timelock delay (in ledgers). May raise, lower or disable
+    /// (`0`) the delay; the timelock itself protects the change.
     SetTimelockDelay(u32),
     /// Replace the contract's WASM with the given hash.
     Upgrade(BytesN<32>),
@@ -207,12 +212,18 @@ pub struct PendingAction {
 /// Deployments that want protection against a single compromised admin key can
 /// configure a delay with [`WatcherRegistry::set_timelock_delay`]. While a
 /// delay is set, the sensitive actions (`add_admin`, `transfer_admin`,
-/// `clear_all_watchers`, `upgrade`, and lowering the delay itself) can no
-/// longer be called directly: they must be queued with
+/// `upgrade`, and lowering the delay itself) can no longer be called
+/// directly: they must be queued with
 /// [`WatcherRegistry::propose_admin_action`] and run with
 /// [`WatcherRegistry::execute_admin_action`] once the delay has elapsed, giving
 /// the other admins a window to [`WatcherRegistry::cancel_admin_action`].
 /// The delay defaults to `0`, which keeps the direct entrypoints available.
+/// # Guardian
+/// A low-privilege guardian address may be configured with
+/// [`WatcherRegistry::set_guardian`]. The guardian can call
+/// [`WatcherRegistry::pause`] (but not [`WatcherRegistry::unpause`]), so
+/// on-call responders can trip the circuit breaker without holding an
+/// upgrade-capable admin key.
 /// # Role policy
 /// Roles are **not mutually exclusive and are not restricted to external
 /// accounts**, by design:
@@ -1002,48 +1013,18 @@ impl WatcherRegistry {
         out
     }
 
-    /// Remove all registered watchers in a single admin call.
-    ///
-    /// This is a bulk deauthorization operation.  Each removed watcher emits
-    /// a `("watcher", "remove")` event so dependent systems can revoke trust
-    /// for every affected address. Refused outright when [`MIN_WATCHERS`] is
-    /// greater than zero and the registry is non-empty, since clearing would
-    /// necessarily drop the count below that threshold; use [`WatcherRegistry::remove_watcher`]
-    /// for selective removal instead.
-    ///
-    /// Sensitive: when a timelock delay is configured this must be queued via
-    /// [`WatcherRegistry::propose_admin_action`] instead of called directly.
-    ///
-    /// # Auth
-    /// Requires a valid Stellar auth signature from `admin`, who must be an
-    /// existing admin.
-    /// # Errors
-    /// Returns [`ContractError::BelowMinWatchers`] if the registry is non-empty and [`MIN_WATCHERS`] is greater than zero.
-    /// Returns [`ContractError::NotInitialized`] if the contract has not been initialized.
-    /// Returns [`ContractError::Unauthorized`] if the caller is not authorized for this operation.
-    /// Returns [`ContractError::TimelockRequired`] if a timelock delay is configured.
-    /// # Panics
-    /// Panics if the contract's stored state is malformed or missing.
-    pub fn clear_all_watchers(env: Env, admin: Address) -> Result<(), ContractError> {
-        admin.require_auth();
-        Self::assert_admin(&env, &admin)?;
-        Self::assert_timelock_disabled(&env)?;
-
-        Self::assert_not_paused(&env)?;
-
-        Self::do_clear_all_watchers(&env)
-    }
-
     /// Remove up to `max_count` registered watchers in a single admin call.
     ///
-    /// Batched fallback for [`WatcherRegistry::clear_all_watchers`] — with a large enough
-    /// watcher set, clearing everything and emitting one event per watcher in
-    /// a single transaction can exceed per-transaction resource/event
-    /// limits. Call this repeatedly until [`WatcherRegistry::get_watcher_count`] returns 0 to
-    /// clear an arbitrarily large watcher set.
+    /// Bulk deauthorization for large watcher sets — clearing everything and
+    /// emitting one event per watcher in a single transaction can exceed
+    /// per-transaction resource/event limits. Call this repeatedly until
+    /// [`WatcherRegistry::get_watcher_count`] returns [`MIN_WATCHERS`] to
+    /// deauthorize an arbitrarily large watcher set while keeping the
+    /// minimum required watchers.
     ///
     /// Watchers are removed from the front of the list. Each removed watcher
-    /// emits a `("watcher", "remove")` event.
+    /// emits a `("watcher", "remove")` event, and its [`WatcherInfo`] and
+    /// scope entries are deleted so a re-registered address starts fresh.
     ///
     /// # Auth
     /// Requires a valid Stellar auth signature from `admin`, who must be an
@@ -1051,6 +1032,7 @@ impl WatcherRegistry {
     /// # Errors
     /// Returns [`ContractError::NotInitialized`] if the contract has not been initialized.
     /// Returns [`ContractError::Unauthorized`] if the caller is not authorized for this operation.
+    /// Returns [`ContractError::BelowMinWatchers`] if removing `max_count` watchers would drop the count below [`MIN_WATCHERS`].
     /// # Panics
     /// Panics if the contract's stored state is malformed or missing.
     pub fn clear_watchers_batch(
@@ -1062,12 +1044,14 @@ impl WatcherRegistry {
         Self::assert_admin(&env, &admin)?;
 
         let watchers = Self::load_watchers(&env);
-        let remove_count = max_count.min(watchers.len());
+        let removable = watchers.len().saturating_sub(MIN_WATCHERS);
+        let remove_count = max_count.min(removable);
 
         let mut remaining: Vec<Address> = vec![&env];
         for i in 0..watchers.len() {
             let w = watchers.get(i).unwrap();
             if i < remove_count {
+                Self::delete_watcher_metadata(&env, &w);
                 env.events()
                     .publish((symbol_short!("watcher"), symbol_short!("remove")), (w,));
             } else {
@@ -1166,25 +1150,73 @@ impl WatcherRegistry {
     ///
     /// Intended as an emergency circuit-breaker if an admin key is suspected
     /// compromised — mutations can be frozen while the incident is investigated.
-    /// Calling `pause` while already paused does nothing.
+    /// Callable by an admin **or** the configured guardian (see
+    /// [`WatcherRegistry::set_guardian`]), so on-call responders can trip the
+    /// breaker without holding an upgrade-capable key. Calling `pause` while
+    /// already paused does nothing.
     /// # Auth
     /// Requires a valid Stellar auth signature from `caller`, who must be an
+    /// existing admin or the configured guardian.
+    /// # Errors
+    /// Returns [`ContractError::NotInitialized`] if the contract has not been initialized.
+    /// Returns [`ContractError::Unauthorized`] if the caller is neither an admin nor the guardian.
+    /// # Events
+    /// Emits `("admin", "pause")` with data `(caller: Address,)`.
+    pub fn pause(env: Env, caller: Address) -> Result<(), ContractError> {
+        caller.require_auth();
+        Self::assert_admin_or_guardian(&env, &caller)?;
+        if !Self::is_paused(env.clone()) {
+            env.storage().instance().set(&DataKey::Paused, &true);
+            env.events()
+                .publish((symbol_short!("admin"), symbol_short!("pause")), (caller,));
+        }
+        Ok(())
+    }
+
+    /// Set (or clear, with `None`) the guardian address allowed to call
+    /// [`WatcherRegistry::pause`] (admin-only).
+    ///
+    /// The guardian is a low-privilege incident-response role: it can trip the
+    /// pause circuit breaker but cannot unpause, mutate the registry, or
+    /// upgrade the contract.
+    ///
+    /// # Auth
+    /// Requires a valid Stellar auth signature from `admin`, who must be an
     /// existing admin.
     /// # Errors
     /// Returns [`ContractError::NotInitialized`] if the contract has not been initialized.
     /// Returns [`ContractError::Unauthorized`] if the caller is not authorized for this operation.
-    pub fn pause(env: Env, caller: Address) -> Result<(), ContractError> {
-        caller.require_auth();
-        Self::assert_admin(&env, &caller)?;
-        if !Self::is_paused(env.clone()) {
-            env.storage().instance().set(&DataKey::Paused, &true);
-            env.events()
-                .publish((symbol_short!("admin"), symbol_short!("pause")), caller);
+    /// # Events
+    /// Emits `("admin", "guardian")` with data `(admin: Address, guardian: Option<Address>)`.
+    pub fn set_guardian(
+        env: Env,
+        admin: Address,
+        guardian: Option<Address>,
+    ) -> Result<(), ContractError> {
+        admin.require_auth();
+        Self::assert_admin(&env, &admin)?;
+
+        match &guardian {
+            Some(g) => env.storage().instance().set(&DataKey::Guardian, g),
+            None => env.storage().instance().remove(&DataKey::Guardian),
         }
-        env.storage().instance().set(&DataKey::Paused, &true);
-        env.events()
-            .publish((symbol_short!("admin"), symbol_short!("pause")), (caller,));
+
+        env.events().publish(
+            (symbol_short!("admin"), symbol_short!("guardian")),
+            (admin, guardian),
+        );
+
         Ok(())
+    }
+
+    /// Get the configured guardian address, if any.
+    /// # Errors
+    /// Returns [`ContractError::GuardianNotSet`] if no guardian has been configured.
+    pub fn get_guardian(env: Env) -> Result<Address, ContractError> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Guardian)
+            .ok_or(ContractError::GuardianNotSet)
     }
 
     /// Resume normal operation after a [`WatcherRegistry::pause`].
@@ -1283,7 +1315,7 @@ impl WatcherRegistry {
     // ── Timelock ─────────────────────────────────────────────────────────────
 
     /// Set the timelock delay, in ledgers, applied to sensitive admin actions
-    /// (`add_admin`, `transfer_admin`, `clear_all_watchers`, `upgrade`).
+    /// (`add_admin`, `transfer_admin`, `upgrade`).
     ///
     /// A delay of `0` (the default) keeps those entrypoints callable directly.
     /// Once a non-zero delay is configured they return
@@ -1350,9 +1382,7 @@ impl WatcherRegistry {
     /// Returns [`ContractError::ActionAlreadyPending`] if another action is already queued.
     /// Returns [`ContractError::AdminAlreadyExists`] if `action` is [`AdminAction::AddAdmin`] for an existing admin.
     /// Returns [`ContractError::MaxAdminsReached`] if `action` is [`AdminAction::AddAdmin`] and the admin set is full.
-    /// Returns [`ContractError::BelowMinWatchers`] if `action` is [`AdminAction::ClearAllWatchers`] and the registry is non-empty.
     /// Returns [`ContractError::DelayTooLarge`] if `action` is [`AdminAction::SetTimelockDelay`] above [`MAX_TIMELOCK_DELAY`].
-    /// Returns [`ContractError::TimelockRequired`] if `action` is [`AdminAction::SetTimelockDelay`] below the current delay.
     ///
     /// Note: [`AdminAction::Upgrade`] is not pre-validated here — whether a
     /// WASM hash is installed is a host-level check that
@@ -1382,18 +1412,12 @@ impl WatcherRegistry {
                     return Err(ContractError::MaxAdminsReached);
                 }
             }
-            AdminAction::ClearAllWatchers => {
-                let watchers = Self::load_watchers(&env);
-                if !watchers.is_empty() && MIN_WATCHERS > 0 {
-                    return Err(ContractError::BelowMinWatchers);
-                }
-            }
             AdminAction::SetTimelockDelay(delay) => {
+                // Any value is acceptable here, including 0 (disable) and
+                // values below the current delay: the timelock itself is the
+                // protection, so lowering it must go through propose/execute.
                 if *delay > MAX_TIMELOCK_DELAY {
                     return Err(ContractError::DelayTooLarge);
-                }
-                if *delay < Self::timelock_delay(&env) {
-                    return Err(ContractError::TimelockRequired);
                 }
             }
             AdminAction::TransferAdmin(_) | AdminAction::Upgrade(_) => {}
@@ -1488,7 +1512,6 @@ impl WatcherRegistry {
             AdminAction::TransferAdmin(new_admin) => {
                 Self::do_transfer_admin(&env, new_admin);
             }
-            AdminAction::ClearAllWatchers => Self::do_clear_all_watchers(&env)?,
             AdminAction::SetTimelockDelay(delay) => {
                 if delay > MAX_TIMELOCK_DELAY {
                     return Err(ContractError::DelayTooLarge);
@@ -1528,6 +1551,29 @@ impl WatcherRegistry {
             return Err(ContractError::TimelockRequired);
         }
         Ok(())
+    }
+
+    /// Return `Ok(())` when `caller` is an admin or the configured guardian.
+    fn assert_admin_or_guardian(env: &Env, caller: &Address) -> Result<(), ContractError> {
+        if Self::is_admin(env.clone(), caller.clone()) {
+            return Ok(());
+        }
+        let guardian: Option<Address> = env.storage().instance().get(&DataKey::Guardian);
+        match guardian {
+            Some(g) if g == *caller => Ok(()),
+            _ => Err(ContractError::Unauthorized),
+        }
+    }
+
+    /// Delete the [`WatcherInfo`] and [`WatcherScope`] entries for `watcher`,
+    /// so a re-registered address starts with no metadata and no scope.
+    fn delete_watcher_metadata(env: &Env, watcher: &Address) {
+        env.storage()
+            .instance()
+            .remove(&DataKey::WatcherInfo(watcher.clone()));
+        env.storage()
+            .instance()
+            .remove(&DataKey::WatcherScope(watcher.clone()));
     }
 
     fn do_set_timelock_delay(env: &Env, caller: &Address, delay_ledgers: u32) {
@@ -1598,30 +1644,7 @@ impl WatcherRegistry {
         );
     }
 
-    /// Deauthorize every registered watcher, emitting one removal event each.
-    ///
-    /// Enforces [`MIN_WATCHERS`] itself (rather than leaving it to callers) so
-    /// the guard applies identically whether this runs from
-    /// [`WatcherRegistry::clear_all_watchers`]'s direct path or from
-    /// `execute_admin_action`'s `ClearAllWatchers` arm — previously the check
-    /// lived only in `clear_all_watchers`, so enabling the timelock bypassed it.
-    /// # Errors
-    /// Returns [`ContractError::BelowMinWatchers`] if the registry is
-    /// non-empty and [`MIN_WATCHERS`] is greater than zero.
-    fn do_clear_all_watchers(env: &Env) -> Result<(), ContractError> {
-        let watchers = Self::load_watchers(env);
-        if !watchers.is_empty() && MIN_WATCHERS > 0 {
-            return Err(ContractError::BelowMinWatchers);
-        }
 
-        for i in 0..watchers.len() {
-            let w = watchers.get(i).unwrap();
-            env.events()
-                .publish((symbol_short!("watcher"), symbol_short!("remove")), (w,));
-        }
-
-        let empty: Vec<Address> = vec![env];
-        env.storage().instance().set(&DataKey::Watchers, &empty);
 
         // Reset the count to zero
         env.storage().instance().set(&symbol_short!("W_CNT"), &0u32);
@@ -3513,11 +3536,11 @@ mod tests {
         let attacker = Address::generate(&env);
 
         client.set_timelock_delay(&admin, &TEST_DELAY);
-        client.propose_admin_action(&admin, &AdminAction::ClearAllWatchers);
+        client.propose_admin_action(&admin, &AdminAction::SetTimelockDelay(0));
 
         assert_eq!(
             client
-                .try_propose_admin_action(&attacker, &AdminAction::ClearAllWatchers)
+                .try_propose_admin_action(&attacker, &AdminAction::SetTimelockDelay(0))
                 .unwrap_err()
                 .unwrap(),
             ContractError::Unauthorized
@@ -3605,15 +3628,103 @@ mod tests {
         );
     }
 
-    // 42. clear_all_watchers still works when executed through the timelock.
+    // 42. #591 — a lower delay may be proposed and executed through the timelock.
     #[test]
-    fn test_execute_clear_all_watchers() {
-        // Regression test for #407: with watchers registered, MIN_WATCHERS
-        // (1) must reject `ClearAllWatchers` the same way whether it is
-        // queued behind the timelock or called directly — previously the
-        // check lived only in `clear_all_watchers`, so the timelocked path
-        // via `propose_admin_action`/`execute_admin_action` bypassed it and
-        // actually cleared every watcher.
+    fn test_lower_delay_through_timelock() {
+        let (env, admin, client) = setup();
+
+        client.set_timelock_delay(&admin, &TEST_DELAY);
+        // The direct setter stays raise-only.
+        assert_eq!(
+            client
+                .try_set_timelock_delay(&admin, &(TEST_DELAY / 2))
+                .unwrap_err()
+                .unwrap(),
+            ContractError::TimelockRequired
+        );
+
+        // Proposing a lower value is accepted.
+        client.propose_admin_action(&admin, &AdminAction::SetTimelockDelay(TEST_DELAY / 2));
+        advance_ledgers(&env, TEST_DELAY);
+        client.execute_admin_action(&admin);
+
+        assert_eq!(client.get_timelock_delay(), TEST_DELAY / 2);
+    }
+
+    // 42b. #591 — the delay can be disabled (set to zero) through the timelock.
+    #[test]
+    fn test_disable_delay_through_timelock() {
+        let (env, admin, client) = setup();
+
+        client.set_timelock_delay(&admin, &TEST_DELAY);
+        client.propose_admin_action(&admin, &AdminAction::SetTimelockDelay(0));
+        advance_ledgers(&env, TEST_DELAY);
+        client.execute_admin_action(&admin);
+
+        assert_eq!(client.get_timelock_delay(), 0);
+        // With the delay disabled, direct sensitive calls work again.
+        let new_admin = Address::generate(&env);
+        assert_eq!(client.try_add_admin(&admin, &new_admin).unwrap(), Ok(()));
+    }
+
+    // 42c. #594 — re-registering a removed watcher starts unscoped and
+    // without metadata.
+    #[test]
+    fn test_reregistered_watcher_starts_unscoped() {
+        let (env, admin, client) = setup();
+        let w = Address::generate(&env);
+        let target = Address::generate(&env);
+
+        client.register_watcher(&admin, &w);
+        client.set_watcher_scope(&admin, &w, &vec![&env, target.clone()]);
+        client.set_watcher_info(
+            &admin,
+            &w,
+            &Some(WatcherInfo {
+                label: String::from_str(&env, "old"),
+                operator: String::from_str(&env, "ops"),
+            }),
+        );
+
+        client.remove_watcher(&admin, &w);
+        assert_eq!(client.get_watcher_scope(&w).len(), 0);
+        assert!(client.get_watcher_info(&w).is_none());
+
+        client.register_watcher(&admin, &w);
+        assert_eq!(client.get_watcher_scope(&w).len(), 0);
+        assert!(client.get_watcher_info(&w).is_none());
+    }
+
+    // 42d. #594 — clear_watchers_batch also deletes metadata and scope.
+    #[test]
+    fn test_clear_watchers_batch_deletes_metadata() {
+        let (env, admin, client) = setup();
+        let w1 = Address::generate(&env);
+        let w2 = Address::generate(&env);
+        let target = Address::generate(&env);
+
+        client.register_watcher(&admin, &w1);
+        client.register_watcher(&admin, &w2);
+        client.set_watcher_scope(&admin, &w1, &vec![&env, target]);
+        client.set_watcher_info(
+            &admin,
+            &w1,
+            &Some(WatcherInfo {
+                label: String::from_str(&env, "one"),
+                operator: String::from_str(&env, "ops"),
+            }),
+        );
+
+        client.clear_watchers_batch(&admin, &1);
+
+        assert_eq!(client.get_watcher_count(), MIN_WATCHERS);
+        assert_eq!(client.get_watcher_scope(&w1).len(), 0);
+        assert!(client.get_watcher_info(&w1).is_none());
+    }
+
+    // 42e. #592 — clear_watchers_batch preserves MIN_WATCHERS.
+    #[test]
+    fn test_clear_watchers_batch_preserves_min_watchers() {
         let (env, admin, client) = setup();
         let w1 = Address::generate(&env);
         let w2 = Address::generate(&env);
@@ -3621,18 +3732,69 @@ mod tests {
         client.register_watcher(&admin, &w1);
         client.register_watcher(&admin, &w2);
 
-        client.set_timelock_delay(&admin, &TEST_DELAY);
+        client.clear_watchers_batch(&admin, &MAX_WATCHERS);
+        assert_eq!(client.get_watcher_count(), MIN_WATCHERS);
+        assert_eq!(client.get_watchers().len(), MIN_WATCHERS as usize);
+    }
+
+    // 42f. #601 — the guardian can pause but not unpause.
+    #[test]
+    fn test_guardian_can_pause_but_not_unpause() {
+        let (env, admin, client) = setup();
+        let guardian = Address::generate(&env);
+
         assert_eq!(
-            client
-                .try_propose_admin_action(&admin, &AdminAction::ClearAllWatchers)
-                .unwrap_err()
-                .unwrap(),
-            ContractError::BelowMinWatchers
+            client.try_get_guardian().unwrap_err().unwrap(),
+            ContractError::GuardianNotSet
         );
 
-        // Watchers are untouched since the action was never queued.
-        assert_eq!(client.get_watchers().len(), 2);
-        assert_eq!(client.get_watcher_count(), 2);
+        client.set_guardian(&admin, &Some(guardian.clone()));
+        assert_eq!(client.get_guardian(), guardian);
+
+        client.pause(&guardian);
+        assert!(client.is_paused());
+
+        assert_eq!(
+            client.try_unpause(&guardian).unwrap_err().unwrap(),
+            ContractError::Unauthorized
+        );
+        assert!(client.is_paused());
+
+        // An admin can still unpause.
+        client.unpause(&admin);
+        assert!(!client.is_paused());
+    }
+
+    // 42g. #601 — a non-guardian, non-admin cannot pause.
+    #[test]
+    fn test_non_guardian_cannot_pause() {
+        let (env, admin, client) = setup();
+        let guardian = Address::generate(&env);
+        let attacker = Address::generate(&env);
+
+        client.set_guardian(&admin, &Some(guardian));
+        assert_eq!(
+            client.try_pause(&attacker).unwrap_err().unwrap(),
+            ContractError::Unauthorized
+        );
+    }
+
+    // 42h. #601 — clearing the guardian revokes pause rights.
+    #[test]
+    fn test_clearing_guardian_revokes_pause() {
+        let (env, admin, client) = setup();
+        let guardian = Address::generate(&env);
+
+        client.set_guardian(&admin, &Some(guardian.clone()));
+        client.set_guardian(&admin, &None);
+        assert_eq!(
+            client.try_get_guardian().unwrap_err().unwrap(),
+            ContractError::GuardianNotSet
+        );
+        assert_eq!(
+            client.try_pause(&guardian).unwrap_err().unwrap(),
+            ContractError::Unauthorized
+        );
     }
 
     // 34. register_watchers emits one event per newly-added watcher
@@ -3796,7 +3958,7 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "Error(Auth, InvalidAction)")]
-    fn test_clear_all_watchers_requires_auth() {
+    fn test_clear_watchers_batch_requires_auth() {
         let env = Env::default();
         let admin = Address::generate(&env);
         let contract_id = env.register(WatcherRegistry, (&admin,));
@@ -3805,7 +3967,7 @@ mod tests {
         env.mock_all_auths();
         client.register_watcher(&admin, &watcher);
         env.set_auths(&[]);
-        client.clear_all_watchers(&admin);
+        client.clear_watchers_batch(&admin, &1);
     }
 
     // === Pre-initialization coverage
@@ -3823,12 +3985,15 @@ mod tests {
     }
 
     #[test]
-    fn test_clear_all_watchers_before_initialize() {
+    fn test_clear_watchers_batch_before_initialize() {
         let (env, client) = uninit();
         let admin = Address::generate(&env);
 
         assert_eq!(
-            client.try_clear_all_watchers(&admin).unwrap_err().unwrap(),
+            client
+                .try_clear_watchers_batch(&admin, &1)
+                .unwrap_err()
+                .unwrap(),
             ContractError::NotInitialized
         );
     }

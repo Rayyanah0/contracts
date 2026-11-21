@@ -94,14 +94,20 @@ Source: `contracts/watcher-registry/src/lib.rs`
 | `DataKey::PendingAdminTransfer` | Instance | `(Address, u32)` (new admin, expiry ledger) | Address proposed by `propose_admin_transfer`, awaiting `accept_admin_transfer`; removed on accept or `cancel_admin_transfer` |
 | `DataKey::TimelockDelay` | Instance | `u32` | Timelock delay in ledgers for sensitive admin actions; absent or `0` means disabled |
 | `DataKey::PendingAction` | Instance | `PendingAction` | The single queued timelocked `AdminAction` with its proposer and `ready_at` ledger; removed on execute or `cancel_admin_action` |
-| `DataKey::Paused` | Instance | `bool` | Circuit-breaker flag set by `pause` / `unpause`; absent means not paused |
+| `DataKey::Paused` | Instance | `bool` | Circuit-breaker flag set by `pause` / `unpause`; absent means not paused. The guardian may call `pause` but never `unpause` |
+| `DataKey::Guardian` | Instance | `Option<Address>` | Optional guardian address set by `set_guardian` (admin only) and read by `get_guardian`. The guardian is a low-privilege on-call role that may call `pause` but never `unpause`; `None` when unset |
+| `DataKey::WatcherInfo(addr: Address)` | Persistent | `WatcherInfo` | Per-watcher metadata (registration ledger, label, etc.). Deleted by `remove_watcher`, `clear_watchers_batch` and `clear_all_watchers`, so a re-registered address starts with fresh metadata |
+| `DataKey::WatcherScope(addr: Address)` | Persistent | `WatcherScope` | Per-watcher scope restricting which contracts the watcher may observe. Deleted alongside `WatcherInfo(addr)` on every removal path, so a re-registered address starts unscoped |
 | `symbol_short!("W_CNT")` | Instance | `u32` | Cached count of registered watchers, kept in sync by `register_watcher` / `remove_watcher` / `replace_watcher` / `clear_all_watchers` so `get_watcher_count` never deserializes the full `Watchers` vec |
+
+`clear_all_watchers` (and the timelocked `AdminAction::ClearAllWatchers`) clears every watcher except a caller-supplied kept set, so it can succeed while `MIN_WATCHERS` watchers remain registered. Each cleared watcher's `WatcherInfo(addr)` and `WatcherScope(addr)` entries are deleted along with its entry in `Watchers`.
+=======
 
 ### TTL Behavior
 
-WatcherRegistry uses **instance storage exclusively**, so every key above shares the single instance entry's TTL. The contract extends it explicitly through `bump_instance_ttl`: a permissionless, auth-free call that, when the remaining TTL is below `INSTANCE_BUMP_THRESHOLD` (17,280 ledgers, ≈ 24 hours), extends it to `INSTANCE_BUMP_AMOUNT` (535,680 ledgers, ≈ 31 days). No other entrypoint extends the TTL, so low-traffic deployments should have a keeper call `bump_instance_ttl` periodically — see [Keeping the Watcher Registry Alive](ttl.md#keeping-the-watcher-registry-alive).
+All instance keys above share the single instance entry's TTL. The contract extends it explicitly through `bump_instance_ttl`: a permissionless, auth-free call that, when the remaining TTL is below `INSTANCE_BUMP_THRESHOLD` (17,280 ledgers, ≈ 24 hours), extends it to `INSTANCE_BUMP_AMOUNT` (535,680 ledgers, ≈ 31 days). No other entrypoint extends the TTL, so low-traffic deployments should have a keeper call `bump_instance_ttl` periodically — see [Keeping the Watcher Registry Alive](ttl.md#keeping-the-watcher-registry-alive).
 
-There are no persistent storage entries in WatcherRegistry.
+`WatcherInfo(addr)` and `WatcherScope(addr)` are persistent entries written by `register_watcher` with `DEFAULT_TTL` (17,280 ledgers) and extended on update. They are deleted — not merely left to expire — by `remove_watcher`, `clear_watchers_batch` and `clear_all_watchers`, so a removed address that registers again starts with no metadata and no scope.
 
 ---
 
@@ -113,4 +119,5 @@ There are no persistent storage entries in WatcherRegistry.
 | AlertRegistry | Instance | `NEXT_ID`, `LIVE`, `ADMIN`, `PAUSED`, `LIMIT`, `CLIMIT`, `GLIMIT`, `WATCHREG`, `PendingAdminTransfer`, `Guardian` | Contract (extended on every instance write and by `bump_instance_ttl`, to 535,680 ledgers) |
 | AlertRegistry | Persistent | `Alert`, `RemovedAlert`, `AlertActive`, `AdminSuspended`, `OwnerIndex`, `OwnerLiveCount`, `ContractIndex`, `ContractLiveCount`, `DeactivationCursor`, `PendingTransfer`, `AlertExpiry` | Contract (`extend_ttl` to `DEFAULT_TTL` = 17,280 ledgers on write, except `PendingTransfer` at `ALERT_TRANSFER_EXPIRY_LEDGERS`; `bump_alert` up to `MAX_TTL`) |
 | AlertRegistry | Instance | `NEXT_ID`, `LIVE`, `ADMIN`, `PAUSED`, `LIMIT`, `CLIMIT`, `GLIMIT`, `WATCHREG`, `Guardian` | Contract (extended on every instance write and by `bump_instance_ttl`, to 535,680 ledgers) |
-| WatcherRegistry | Instance | `Admins`, `Watchers`, `PendingAdminTransfer`, `TimelockDelay`, `PendingAction`, `Paused`, `W_CNT` | Contract (`bump_instance_ttl`, extends to 535,680 ledgers) |
+| WatcherRegistry | Instance | `Admins`, `Watchers`, `PendingAdminTransfer`, `TimelockDelay`, `PendingAction`, `Paused`, `Guardian`, `W_CNT` | Contract (`bump_instance_ttl`, extends to 535,680 ledgers) |
+| WatcherRegistry | Persistent | `WatcherInfo`, `WatcherScope` | Contract (`extend_ttl` to `DEFAULT_TTL` = 17,280 ledgers on write; deleted on removal) |
