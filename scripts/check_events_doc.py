@@ -73,6 +73,8 @@ def parse_doc_events(doc_path: str) -> dict:
         elif line_str.startswith("### ") and current_contract:
             # e.g., "### `alert.register`", "### alert.register" or "### `alert.xfer_rej` / `alert.xfer_can`"
             heading = line_str.replace("### ", "").replace("`", "").strip()
+            # Strip trailing parenthetical annotations, e.g. "alert.register (versioned)".
+            heading = re.sub(r"\s*\([^)]*\)\s*$", "", heading).strip()
             current_events = [name.strip() for name in heading.split("/") if "." in name]
             for event_name in current_events:
                 doc_data[current_contract][event_name] = {"status": "unknown"}

@@ -101,7 +101,7 @@ Two-step and queued admin operations keep authority in storage between transacti
 - The contract clears pending state on every transition listed in the table above.
 - `accept_admin_transfer` is rejected once the expiry ledger has passed, and when the proposer is no longer an admin.
 - Any admin can call `cancel_admin_transfer` or `cancel_admin_action` at any time, including during an incident.
-- **Gap:** `pause` does **not** block `accept_admin_transfer` on `WatcherRegistry`; the entrypoint has no pause check. During an incident, cancel the proposal rather than relying on the pause.
+- `pause` blocks `accept_admin_transfer` on `WatcherRegistry` (it returns `ContractError::Paused`), matching `AlertRegistry`, so a pending takeover cannot be completed while the registry is paused. `cancel_admin_transfer` remains callable while paused, so an admin can still clear a suspicious proposal during an incident.
 
 ### Operator checks
 
@@ -165,6 +165,7 @@ stellar contract invoke --id <WATCHER_REGISTRY_CONTRACT_ID> --network <NETWORK> 
 | `transfer_admin` cannot strip other admins in a multi-admin set | ✅ |
 | Minimum watcher count enforced on removal | ✅ (`MIN_WATCHERS`) |
 | Emergency pause / circuit-breaker on mutations | ✅ |
+| Pause blocks `accept_admin_transfer` (cancel still allowed) | ✅ |
 | Replay protection | ✅ (Stellar protocol) |
 | Admin key compromise protection | ⚠️ partial (opt-in time-lock on sensitive actions) |
 | Admin key compromise protection | ❌ (mitigated via `pause` + `remove_admin`, not prevented) |

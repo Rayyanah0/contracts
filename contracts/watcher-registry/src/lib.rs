@@ -12,11 +12,15 @@
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contractmeta, contracttype, symbol_short, vec, Address,
-    BytesN, Env, String, Vec,
+    BytesN, Env, String, Symbol, Vec,
 };
 
 contractmeta!(key = "Name", val = "WatcherRegistry");
-contractmeta!(key = "Version", val = "0.1.0");
+contractmeta!(key = "Version", val = "0.2.0");
+
+/// Current storage schema version, written by `__constructor`/`initialize`
+/// and advanced by [`WatcherRegistry::migrate`]. See `docs/upgrade-guide.md`.
+pub const CURRENT_SCHEMA_VERSION: u32 = 1;
 
 // ── Errors ────────────────────────────────────────────────────────────────────
 
@@ -69,6 +73,13 @@ pub enum ContractError {
     /// Returned by `remove_admin` when `target_admin` is not currently an
     /// admin, so there is nothing to remove.
     AdminNotFound = 17,
+    /// Returned by `set_watcher_scope` when the proposed scope contains an
+    /// entry that can never be a valid target: the registry's own address or
+    /// the watcher itself.
+    InvalidScopeTarget = 18,
+    /// Returned by `migrate` when `from` does not match the stored schema
+    /// version, or when `to` is not greater than `from`.
+    InvalidSchemaVersion = 19,
 }
 
 // ── TTL constants ────────────────────────────────────────────────────────────
@@ -144,6 +155,10 @@ pub enum DataKey {
     /// watcher is scoped to. Absent, or present but empty, means
     /// unrestricted (authorized for every target).
     WatcherScope(Address),
+    /// Stores the `u32` storage schema version (see
+    /// [`CURRENT_SCHEMA_VERSION`]). Written by `__constructor`/`initialize`
+    /// and advanced by [`WatcherRegistry::migrate`].
+    SchemaVersion,
 }
 
 /// Optional off-chain-identifying metadata for a registered watcher.
@@ -237,6 +252,9 @@ impl WatcherRegistry {
     pub fn __constructor(env: Env, admin: Address) {
         let admins: Vec<Address> = vec![&env, admin.clone()];
         env.storage().instance().set(&DataKey::Admins, &admins);
+        env.storage()
+            .instance()
+            .set(&DataKey::SchemaVersion, &CURRENT_SCHEMA_VERSION);
 
         env.events()
             .publish((symbol_short!("admin"), symbol_short!("init")), (admin,));
@@ -1216,6 +1234,66 @@ impl WatcherRegistry {
             .instance()
             .get(&DataKey::Paused)
             .unwrap_or(false)
+    }
+
+    /// Return the stored storage schema version.
+    ///
+    /// Returns `0` for contracts deployed before schema versioning existed
+    /// (no `SchemaVersion` entry); such deployments should run
+    /// [`WatcherRegistry::migrate`] from `0` to [`CURRENT_SCHEMA_VERSION`].
+    #[must_use]
+    pub fn get_schema_version(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::SchemaVersion)
+            .unwrap_or(0u32)
+    }
+
+    /// Advance the storage schema version from `from` to `to`.
+    ///
+    /// Resumable: `cursor` is the index of the next item to process in the
+    /// migration step. Pass `cursor == 0` to start; the call returns the
+    /// cursor to pass to the next call. When the cursor reaches the end of
+    /// the work for this step, the stored schema version is advanced to `to`
+    /// and the returned cursor is `0`.
+    ///
+    /// The current layout needs no data rewriting, so a single call with
+    /// `cursor == 0` completes the migration.
+    ///
+    /// # Auth
+    /// Requires a valid Stellar auth signature from `caller`, who must be an
+    /// existing admin.
+    /// # Errors
+    /// Returns [`ContractError::NotInitialized`] if the contract has not been initialized.
+    /// Returns [`ContractError::Unauthorized`] if the caller is not authorized for this operation.
+    /// Returns [`ContractError::InvalidSchemaVersion`] if `from` does not match the
+    /// stored version or `to` is not greater than `from`.
+    pub fn migrate(
+        env: Env,
+        caller: Address,
+        from: u32,
+        to: u32,
+        cursor: u32,
+    ) -> Result<u32, ContractError> {
+        caller.require_auth();
+        Self::assert_admin(&env, &caller)?;
+
+        let stored = Self::get_schema_version(env.clone());
+        if from != stored || to <= from {
+            return Err(ContractError::InvalidSchemaVersion);
+        }
+
+        // No data rewriting is required for the current layout; the cursor
+        // exists so future migrations can be resumed across transactions.
+        let _ = cursor;
+
+        env.storage().instance().set(&DataKey::SchemaVersion, &to);
+        env.events().publish(
+            (Symbol::new(&env, "schema"), Symbol::new(&env, "migrate")),
+            (from, to),
+        );
+
+        Ok(0)
     }
 
     /// Get the number of registered watchers as a cheap u32 read, avoiding
@@ -3461,6 +3539,107 @@ mod tests {
             ContractError::MaxAdminsReached
         );
         assert!(client.get_pending_action().is_none());
+    }
+
+    /// Regression test for #597 — a pending admin transfer cannot be
+    /// accepted while the registry is paused, but can still be cancelled.
+    #[test]
+    fn test_accept_admin_transfer_blocked_while_paused() {
+        let (env, admin, client) = setup();
+        let proposed = Address::generate(&env);
+
+        client.propose_admin_transfer(&admin, &proposed);
+        client.pause(&admin);
+
+        assert_eq!(
+            client
+                .try_accept_admin_transfer(&proposed)
+                .unwrap_err()
+                .unwrap(),
+            ContractError::Paused
+        );
+        assert_eq!(client.get_admins().get(0).unwrap(), admin);
+
+        // Cancelling remains allowed while paused.
+        assert_eq!(client.try_cancel_admin_transfer(&admin).unwrap(), Ok(()));
+        assert!(client.get_pending_admin_transfer().is_none());
+
+        client.unpause(&admin);
+        assert_eq!(
+            client
+                .try_accept_admin_transfer(&proposed)
+                .unwrap_err()
+                .unwrap(),
+            ContractError::NoPendingTransfer
+        );
+    }
+
+    /// Regression test for #600 — `set_watcher_scope` rejects the registry's
+    /// own address and the watcher itself, and deduplicates the rest.
+    #[test]
+    fn test_set_watcher_scope_validates_and_deduplicates() {
+        let (env, admin, client) = setup();
+        let watcher = Address::generate(&env);
+        let target = Address::generate(&env);
+        client.register_watcher(&admin, &watcher);
+
+        let contract_id = client.address.clone();
+        assert_eq!(
+            client
+                .try_set_watcher_scope(&admin, &watcher, &vec![&env, contract_id.clone()])
+                .unwrap_err()
+                .unwrap(),
+            ContractError::InvalidScopeTarget
+        );
+        assert_eq!(
+            client
+                .try_set_watcher_scope(&admin, &watcher, &vec![&env, watcher.clone()])
+                .unwrap_err()
+                .unwrap(),
+            ContractError::InvalidScopeTarget
+        );
+
+        assert_eq!(
+            client
+                .try_set_watcher_scope(&admin, &watcher, &vec![&env, target.clone(), target.clone()])
+                .unwrap(),
+            Ok(())
+        );
+        let scope = client.get_watcher_scope(&watcher);
+        assert_eq!(scope.len(), 1);
+        assert_eq!(scope.get(0).unwrap(), target);
+    }
+
+    /// Regression test for #603 — the schema version is written at deploy
+    /// time and `migrate` advances it, rejecting invalid ranges.
+    #[test]
+    fn test_schema_version_and_migrate() {
+        let (env, admin, client) = setup();
+        assert_eq!(client.get_schema_version(), CURRENT_SCHEMA_VERSION);
+
+        assert_eq!(
+            client
+                .try_migrate(&admin, &0, &(CURRENT_SCHEMA_VERSION + 1), &0)
+                .unwrap_err()
+                .unwrap(),
+            ContractError::InvalidSchemaVersion
+        );
+        assert_eq!(
+            client
+                .try_migrate(&admin, &CURRENT_SCHEMA_VERSION, &CURRENT_SCHEMA_VERSION, &0)
+                .unwrap_err()
+                .unwrap(),
+            ContractError::InvalidSchemaVersion
+        );
+
+        let next = CURRENT_SCHEMA_VERSION + 1;
+        assert_eq!(
+            client
+                .try_migrate(&admin, &CURRENT_SCHEMA_VERSION, &next, &0)
+                .unwrap(),
+            Ok(0)
+        );
+        assert_eq!(client.get_schema_version(), next);
     }
 
     /// Regression test for #410 — a direct `transfer_admin` must clear a

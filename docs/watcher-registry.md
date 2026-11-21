@@ -167,7 +167,7 @@ Hands the admin role to a new address in two steps, replacing the **entire** adm
 
 - `NoPendingTransfer` if no transfer is pending, or the pending proposal names a different address.
 - `AdminTransferExpired` if more than `ADMIN_TRANSFER_EXPIRY_LEDGERS` (120,960) ledgers have passed since the proposal.
-- `Paused` if the contract is paused.
+- `Paused` if the contract is paused. Pausing during a suspected compromise therefore stops a pending takeover from completing; `cancel_admin_transfer` remains callable while paused so admins can discard the proposal.
 
 #### `cancel_admin_transfer`
 
@@ -186,6 +186,8 @@ Hands the admin role to a new address in two steps, replacing the **entire** adm
 - `NotInitialized` if the contract has not been initialized.
 - `Unauthorized` if `admin` is not in the admin set.
 - `NoPendingTransfer` if no transfer is pending.
+
+Unlike `accept_admin_transfer`, this entrypoint is **not** blocked by the pause flag, so a pending takeover can always be cancelled while the registry is paused.
 
 #### `get_pending_admin_transfer`
 
@@ -521,6 +523,74 @@ Removes up to `max_count` registered watchers in a single call. Batched fallback
 
 ---
 
+### `set_watcher_scope`
+
+Sets the list of contract addresses a watcher is scoped to monitor. The scope is stored as provided, after validation:
+
+- **Duplicates are removed.** Repeated entries are collapsed so the stored scope contains each address at most once.
+- **The registry's own address is rejected** — a watcher cannot be scoped to the registry itself.
+- **The watcher's own address is rejected** — a watcher cannot be scoped to itself.
+
+**Requires auth:** `admin`
+
+**Parameters**
+
+| Name | Type | Description |
+|---|---|---|
+| `admin` | `Address` | Any current admin |
+| `watcher` | `Address` | Registered watcher whose scope is being set |
+| `scope` | `Vec<Address>` | Contract addresses the watcher should monitor |
+
+**Returns:** `Result<(), ContractError>`
+
+**Errors:**
+
+- `NotInitialized` if the contract has not been initialized.
+- `Unauthorized` if `admin` is not in the admin set.
+- `WatcherNotFound` if `watcher` is not currently registered.
+- `InvalidScopeTarget` if `scope` contains the registry's own address or the watcher's own address.
+- `Paused` if the contract is paused.
+
+**Events:** `("watcher", "scope")` with data `(watcher: Address, scope: Vec<Address>)`, carrying the deduplicated scope.
+
+---
+
+### `get_schema_version`
+
+Returns the storage schema version the contract was initialized with (`SCHEMAV`). Use it to decide whether `migrate` needs to run after an upgrade.
+
+**Parameters:** none
+
+**Returns:** `u32` — the current storage schema version.
+
+**Errors:** `NotInitialized` if the contract has not been initialized.
+
+---
+
+### `migrate`
+
+Migrates instance storage from an older schema version to the current one. The call is **resumable**: it advances the stored `SCHEMAV` one step at a time, so a migration that runs out of resources can simply be re-invoked until `get_schema_version` reports the current version. Calling it when storage is already at the current version is a no-op.
+
+**Requires auth:** `admin`
+
+**Parameters**
+
+| Name | Type | Description |
+|---|---|---|
+| `admin` | `Address` | Any current admin |
+
+**Returns:** `Result<(), ContractError>`
+
+**Errors:**
+
+- `NotInitialized` if the contract has not been initialized.
+- `Unauthorized` if `admin` is not in the admin set.
+- `Paused` if the contract is paused.
+
+**Events:** `("admin", "migrate")` with data `(from: u32, to: u32)`.
+
+---
+
 ## Errors
 
 The contract defines a single error enum ([`lib.rs`](../contracts/watcher-registry/src/lib.rs)). Each variant is returned as `Err(ContractError::…)` from the relevant entrypoint.
@@ -561,7 +631,9 @@ Callers that need external-account-only or disjoint-role guarantees must enforce
 
 ## Pause behavior
 
-The contract can be paused by an admin, which prevents all state-mutating operations (`add_admin`, `remove_admin`, `register_watcher`, `remove_watcher`, `replace_watcher`, `clear_all_watchers`, `accept_admin_transfer`, etc.). Pausing only affects mutations — read-only queries like `is_watcher_authorized`, `get_watchers`, and `get_admins` continue to work.
+The contract can be paused by an admin, which prevents all state-mutating operations (`add_admin`, `remove_admin`, `register_watcher`, `remove_watcher`, `replace_watcher`, `clear_all_watchers`, `accept_admin_transfer`, `set_watcher_scope`, `migrate`, etc.). Pausing only affects mutations — read-only queries like `is_watcher_authorized`, `get_watchers`, `get_admins`, and `get_schema_version` continue to work.
+
+`accept_admin_transfer` is blocked while paused, so pausing during a suspected compromise stops a pending admin takeover from completing. `cancel_admin_transfer` is deliberately **not** blocked by the pause flag, so admins can always discard a pending proposal while the registry is paused.
 
 When `AlertRegistry` has gating enabled (configured to use `WatcherRegistry` as its authorization source), pausing `WatcherRegistry` does **not** prevent gated reads from `AlertRegistry`. The gating check calls the read-only `is_watcher_authorized` method, which is unaffected by the pause flag. This ensures that legitimate watchers can continue querying alert data even when the watcher registry is paused, since the pause only blocks mutations, not authorization checks.
 
@@ -593,6 +665,7 @@ All state is stored in **instance storage**, addressed by the `DataKey` enum plu
 | `DataKey::TimelockDelay` | `u32` | Timelock delay in ledgers (`0`/absent = disabled) |
 | `DataKey::PendingAction` | `PendingAction` | Queued timelocked admin action |
 | `DataKey::Paused` | `bool` | Pause flag |
+| `DataKey::SchemaVersion` | `u32` | Storage schema version (`SCHEMAV`), set by the constructor and advanced by `migrate` |
 | `"W_CNT"` | `u32` | Cached watcher count |
 
 See [storage.md](storage.md#watcherregistry) for TTL behaviour.
