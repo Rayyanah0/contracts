@@ -28,4 +28,13 @@ mod tests {
         assert_eq!(ContractError::NoPendingAction as u32, 10);
         assert_eq!(ContractError::AdminTransferExpired as u32, 16);
     }
+
+    #[test]
+    fn test_length_limit_error_codes_are_stable() {
+        // GH #593: length-limit error variants for watcher metadata and scopes.
+        // These discriminants are part of the public ABI; pin them so they stay stable.
+        assert_eq!(ContractError::LabelTooLong as u32, 17);
+        assert_eq!(ContractError::OperatorTooLong as u32, 18);
+        assert_eq!(ContractError::ScopeTooLong as u32, 19);
+    }
 }

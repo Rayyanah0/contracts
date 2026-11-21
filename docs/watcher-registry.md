@@ -502,6 +502,110 @@ Returns the number of registered watchers as a cheap integer read, avoiding the 
 
 ---
 
+### `get_configuration`
+
+One-shot read of the registry's configuration, so dashboards and monitoring
+tools do not need to call `get_admins`, `is_paused`, `get_timelock_delay`,
+`get_pending_action`, `get_pending_admin_transfer` and `get_watcher_count`
+separately.
+
+**Parameters:** none
+
+**Returns:** `WatcherRegistryConfiguration` — a struct with the following fields:
+
+| Field | Type | Description |
+|---|---|---|
+| `admins` | `Vec<Address>` | Current admin set |
+| `paused` | `bool` | Pause flag |
+| `timelock_delay` | `u32` | Timelock delay in ledgers (`0` = disabled) |
+| `pending_action` | `Option<PendingAction>` | Queued timelocked admin action, if any |
+| `pending_admin_transfer` | `Option<Address>` | Address named in the pending admin transfer, if any |
+| `watcher_count` | `u32` | Number of registered watchers |
+
+**Errors:** none (read-only call; never panics on uninitialized storage — an
+uninitialized registry reports empty `admins` and zeroed counters).
+
+---
+
+### `set_watcher_info`
+
+Stores descriptive metadata for a watcher address.
+
+**Requires auth:** `admin`
+
+**Parameters**
+
+| Name | Type | Description |
+|---|---|---|
+| `admin` | `Address` | Any current admin |
+| `watcher` | `Address` | A **registered** watcher address |
+| `info` | `WatcherInfo` | Metadata record (see below) |
+
+`WatcherInfo` fields are length-capped: `label` and `operator` may each be at
+most `MAX_WATCHER_LABEL_LEN` / `MAX_WATCHER_OPERATOR_LEN` bytes. Longer values
+are rejected with `ContractError::StringTooLong`.
+
+**Returns:** `Result<(), ContractError>`
+
+**Errors:**
+
+- `NotInitialized` if the contract has not been initialized.
+- `Unauthorized` if `admin` is not in the admin set.
+- `Paused` if the contract is paused.
+- `WatcherNotFound` if `watcher` is not currently registered.
+- `StringTooLong` if `label` or `operator` exceeds its cap.
+
+**Events:** `("watcher", "info")` with data `(watcher: Address)`.
+
+---
+
+### `set_watcher_scope`
+
+Stores the scope (e.g. the set of contracts or networks a watcher covers) for a
+watcher address.
+
+**Requires auth:** `admin`
+
+**Parameters**
+
+| Name | Type | Description |
+|---|---|---|
+| `admin` | `Address` | Any current admin |
+| `watcher` | `Address` | A **registered** watcher address |
+| `scope` | `WatcherScope` | Scope record (see below) |
+
+The scope vector is capped at `MAX_WATCHER_SCOPE_LEN` entries; longer vectors
+are rejected with `ContractError::ScopeTooLong`.
+
+**Returns:** `Result<(), ContractError>`
+
+**Errors:**
+
+- `NotInitialized` if the contract has not been initialized.
+- `Unauthorized` if `admin` is not in the admin set.
+- `Paused` if the contract is paused.
+- `WatcherNotFound` if `watcher` is not currently registered.
+- `ScopeTooLong` if the scope vector exceeds its cap.
+
+**Events:** `("watcher", "scope")` with data `(watcher: Address)`.
+
+---
+
+### `get_watcher_info` / `get_watcher_scope`
+
+Read back the metadata stored by the setters above.
+
+**Parameters**
+
+| Name | Type | Description |
+|---|---|---|
+| `watcher` | `Address` | Watcher address to look up |
+
+**Returns:** `Option<WatcherInfo>` / `Option<WatcherScope>` — `None` when no
+metadata has been stored for that address.
+
+---
+
 ### `clear_watchers_batch`
 
 Removes up to `max_count` registered watchers in a single call. Batched fallback for `clear_all_watchers` — call repeatedly until `get_watcher_count` returns 0 to clear an arbitrarily large watcher set without exceeding per-transaction resource/event limits.
@@ -543,6 +647,8 @@ The contract defines a single error enum ([`lib.rs`](../contracts/watcher-regist
 | `ActionAlreadyPending` | `9` | `propose_admin_action` | Another timelocked action is already queued. |
 | `NoPendingAction` | `10` | `execute_admin_action`, `cancel_admin_action` | No timelocked action is queued. |
 | `TimelockNotExpired` | `11` | `execute_admin_action` | The queued action's delay has not elapsed yet. |
+| `StringTooLong` | `17` | `set_watcher_info` | A `WatcherInfo` string field exceeds its length cap. |
+| `ScopeTooLong` | `18` | `set_watcher_scope` | The `WatcherScope` vector exceeds `MAX_WATCHER_SCOPE_LEN`. |
 
 See [Error handling: raw vs `try_` calls](#error-handling-raw-vs-try_-calls) for how these surface through the generated SDK client.
 
@@ -561,7 +667,7 @@ Callers that need external-account-only or disjoint-role guarantees must enforce
 
 ## Pause behavior
 
-The contract can be paused by an admin, which prevents all state-mutating operations (`add_admin`, `remove_admin`, `register_watcher`, `remove_watcher`, `replace_watcher`, `clear_all_watchers`, `accept_admin_transfer`, etc.). Pausing only affects mutations — read-only queries like `is_watcher_authorized`, `get_watchers`, and `get_admins` continue to work.
+The contract can be paused by an admin, which prevents all state-mutating operations (`add_admin`, `remove_admin`, `register_watcher`, `remove_watcher`, `replace_watcher`, `clear_all_watchers`, `accept_admin_transfer`, `set_watcher_info`, `set_watcher_scope`, etc.). Pausing only affects mutations — read-only queries like `is_watcher_authorized`, `get_watchers`, `get_admins`, and `get_configuration` continue to work.
 
 When `AlertRegistry` has gating enabled (configured to use `WatcherRegistry` as its authorization source), pausing `WatcherRegistry` does **not** prevent gated reads from `AlertRegistry`. The gating check calls the read-only `is_watcher_authorized` method, which is unaffected by the pause flag. This ensures that legitimate watchers can continue querying alert data even when the watcher registry is paused, since the pause only blocks mutations, not authorization checks.
 
@@ -595,6 +701,21 @@ All state is stored in **instance storage**, addressed by the `DataKey` enum plu
 | `DataKey::Paused` | `bool` | Pause flag |
 | `"W_CNT"` | `u32` | Cached watcher count |
 
+Per-address watcher metadata lives in **persistent storage** so it does not
+inflate the instance entry that every invocation loads:
+
+| Key | Value | Description |
+|---|---|---|
+| `DataKey::WatcherInfo(Address)` | `WatcherInfo` | Per-watcher metadata written by `set_watcher_info` |
+| `DataKey::WatcherScope(Address)` | `WatcherScope` | Per-watcher scope written by `set_watcher_scope` |
+
+Both persistent entries are extended on write and on read using the contract's
+persistent TTL bump, so they survive as long as they are touched within the TTL
+window. Entries are only written for **registered** watchers, and both setters
+are pause-gated. String fields and scope vectors are bounded (see
+[Capacity limits](#capacity-limits)) so a single entry can never approach the
+ledger entry size limit.
+
 See [storage.md](storage.md#watcherregistry) for TTL behaviour.
 
 ---
@@ -609,6 +730,9 @@ within a transaction's resource budget the sets are bounded:
 |---|---|---|
 | `MAX_WATCHERS` | 100 | `register_watcher` → `MaxWatchersReached` |
 | `MAX_ADMINS` | 10 | `add_admin` → `MaxAdminsReached` |
+| `MAX_WATCHER_LABEL_LEN` | 64 | `set_watcher_info` → `StringTooLong` |
+| `MAX_WATCHER_OPERATOR_LEN` | 64 | `set_watcher_info` → `StringTooLong` |
+| `MAX_WATCHER_SCOPE_LEN` | 32 | `set_watcher_scope` → `ScopeTooLong` |
 
 Registering an address that is already present is still a no-op at the cap, so
 idempotent re-registration never fails. `replace_watcher` also stays available

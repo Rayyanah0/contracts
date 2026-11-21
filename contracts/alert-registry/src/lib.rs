@@ -97,7 +97,11 @@ pub const MAX_PAGE_SIZE: u32 = 100;
 /// this value instead of guessing the shape from the payload length. See
 /// `docs/events.md` for the versioning policy and which events currently
 /// carry this marker.
-pub const EVENT_SCHEMA_VERSION: u32 = 2;
+///
+/// Version 3 (#604) adds the previous value alongside the new one in the
+/// `admin.limit`, `admin.timelock` and `admin.watchreg` config-change events,
+/// so auditors no longer have to replay earlier events to learn what changed.
+pub const EVENT_SCHEMA_VERSION: u32 = 3;
 
 /// Recognized rule descriptors accepted by [`AlertRegistry::validate_rule`].
 pub const VALID_RULE_DESCRIPTORS: [&str; 5] = [
@@ -8164,6 +8168,81 @@ mod tests {
             soroban_sdk::FromVal::from_val(&env, &data);
         assert_eq!(emitted_id2, id);
         assert!(emitted_active2);
+    }
+
+    // Issue #604: admin.limit carries the previous value alongside the new one
+    #[test]
+    fn test_set_per_owner_alert_limit_event_includes_old_value() {
+        use soroban_sdk::{symbol_short, testutils::Events as _};
+
+        let (env, admin, client) = setup();
+
+        // First change: old value is the default (0 = unlimited).
+        client.set_per_owner_alert_limit(&admin, &5u32);
+
+        let events = env.events().all();
+        let limit_event = events
+            .iter()
+            .rev()
+            .find(|(_, topics, _)| {
+                topics.len() == 2
+                    && Symbol::from_val(&env, &topics.get(0).unwrap()) == symbol_short!("admin")
+                    && Symbol::from_val(&env, &topics.get(1).unwrap()) == symbol_short!("limit")
+            })
+            .expect("admin.limit event must be emitted");
+
+        let (_, _, data) = limit_event;
+        let (old, new): (u32, u32) = soroban_sdk::FromVal::from_val(&env, &data);
+        assert_eq!(old, 0);
+        assert_eq!(new, 5);
+
+        // Second change: old value is the previously stored limit.
+        client.set_per_owner_alert_limit(&admin, &9u32);
+
+        let events = env.events().all();
+        let limit_event = events
+            .iter()
+            .rev()
+            .find(|(_, topics, _)| {
+                topics.len() == 2
+                    && Symbol::from_val(&env, &topics.get(0).unwrap()) == symbol_short!("admin")
+                    && Symbol::from_val(&env, &topics.get(1).unwrap()) == symbol_short!("limit")
+            })
+            .expect("admin.limit event must be emitted");
+
+        let (_, _, data) = limit_event;
+        let (old, new): (u32, u32) = soroban_sdk::FromVal::from_val(&env, &data);
+        assert_eq!(old, 5);
+        assert_eq!(new, 9);
+    }
+
+    // Issue #604: admin.watchreg carries the previous value alongside the new one
+    #[test]
+    fn test_set_watcher_registry_event_includes_old_value() {
+        use soroban_sdk::{symbol_short, testutils::Events as _};
+
+        let (env, admin, client) = setup();
+        let registry = env.register(AlertRegistry, (&admin,));
+
+        client.set_watcher_registry(&admin, &Some(registry.clone()));
+
+        let events = env.events().all();
+        let watchreg_event = events
+            .iter()
+            .rev()
+            .find(|(_, topics, _)| {
+                topics.len() == 2
+                    && Symbol::from_val(&env, &topics.get(0).unwrap()) == symbol_short!("admin")
+                    && Symbol::from_val(&env, &topics.get(1).unwrap())
+                        == symbol_short!("watchreg")
+            })
+            .expect("admin.watchreg event must be emitted");
+
+        let (_, _, data) = watchreg_event;
+        let (old, new): (Option<Address>, Option<Address>) =
+            soroban_sdk::FromVal::from_val(&env, &data);
+        assert_eq!(old, None);
+        assert_eq!(new, Some(registry));
     }
 
     // B-7. DEFAULT_TTL and MAX_TTL constants have the expected values

@@ -69,6 +69,12 @@ pub enum ContractError {
     /// Returned by `remove_admin` when `target_admin` is not currently an
     /// admin, so there is nothing to remove.
     AdminNotFound = 17,
+    /// Returned by `set_watcher_info` when `info.label` exceeds [`MAX_LABEL_LEN`].
+    LabelTooLong = 18,
+    /// Returned by `set_watcher_info` when `info.operator` exceeds [`MAX_OPERATOR_LEN`].
+    OperatorTooLong = 19,
+    /// Returned by `set_watcher_scope` when `scope` exceeds [`MAX_SCOPE_LEN`].
+    ScopeTooLong = 20,
 }
 
 // ── TTL constants ────────────────────────────────────────────────────────────
@@ -115,6 +121,29 @@ pub const MIN_WATCHERS: u32 = 1;
 /// such as [`WatcherRegistry::are_watchers_authorized`].
 pub const MAX_PAGE_SIZE: u32 = 100;
 
+/// Maximum length, in bytes, of a [`WatcherInfo::label`] accepted by
+/// [`WatcherRegistry::set_watcher_info`].
+pub const MAX_LABEL_LEN: u32 = 64;
+
+/// Maximum length, in bytes, of a [`WatcherInfo::operator`] accepted by
+/// [`WatcherRegistry::set_watcher_info`].
+pub const MAX_OPERATOR_LEN: u32 = 64;
+
+/// Maximum number of target addresses accepted by
+/// [`WatcherRegistry::set_watcher_scope`].
+pub const MAX_SCOPE_LEN: u32 = 50;
+
+// ── Persistent TTL constants ─────────────────────────────────────────────────
+
+/// Threshold below which persistent watcher metadata/scope entries are
+/// extended on access. Approximately 24 hours at the nominal 5-second ledger
+/// close time.
+pub const DEFAULT_TTL: u32 = 17_280;
+
+/// TTL persistent watcher metadata/scope entries are extended to.
+/// Approximately 31 days, the protocol maximum. See `docs/ttl.md`.
+pub const MAX_TTL: u32 = 535_680;
+
 // ── Storage keys ─────────────────────────────────────────────────────────────
 
 /// Storage key variants used to address instance entries.
@@ -138,11 +167,12 @@ pub enum DataKey {
     PendingAction,
     /// Stores the `bool` paused flag.
     Paused,
-    /// Stores the optional [`WatcherInfo`] for a given watcher address.
+    /// Stores the optional [`WatcherInfo`] for a given watcher address in
+    /// **persistent** storage.
     WatcherInfo(Address),
     /// Stores the optional `Vec<Address>` of target contracts a given
-    /// watcher is scoped to. Absent, or present but empty, means
-    /// unrestricted (authorized for every target).
+    /// watcher is scoped to in **persistent** storage. Absent, or present
+    /// but empty, means unrestricted (authorized for every target).
     WatcherScope(Address),
 }
 
@@ -154,11 +184,39 @@ pub enum DataKey {
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WatcherInfo {
-    /// Human-readable label for the watcher (operator-chosen free text).
+    /// Human-readable label for the watcher (operator-chosen free text,
+    /// capped at [`MAX_LABEL_LEN`] bytes).
     pub label: String,
     /// Identifier for the operator running this watcher (free text, e.g. an
-    /// organization name or contact handle).
+    /// organization name or contact handle, capped at [`MAX_OPERATOR_LEN`]
+    /// bytes).
     pub operator: String,
+}
+
+// ── Configuration snapshot ───────────────────────────────────────────────────
+
+/// One-shot snapshot of the registry's configuration, returned by
+/// [`WatcherRegistry::get_configuration`].
+///
+/// Aggregates the values that dashboards otherwise fetch with separate calls
+/// to `get_admins`, `is_paused`, `get_timelock_delay`, `get_pending_action`,
+/// `get_pending_admin_transfer` and `get_watcher_count`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WatcherRegistryConfiguration {
+    /// Current admin set.
+    pub admins: Vec<Address>,
+    /// Whether the registry is currently paused.
+    pub paused: bool,
+    /// Timelock delay in ledgers (`0` means disabled).
+    pub timelock_delay: u32,
+    /// The single queued [`PendingAction`], if any.
+    pub pending_action: Option<PendingAction>,
+    /// The pending admin transfer `(proposer, new_admin, expires_at_ledger)`,
+    /// if any.
+    pub pending_admin_transfer: Option<(Address, Address, u32)>,
+    /// Number of registered watchers.
+    pub watcher_count: u32,
 }
 
 // ── Timelock types ───────────────────────────────────────────────────────────
@@ -882,8 +940,9 @@ impl WatcherRegistry {
     /// non-empty scope restricts [`WatcherRegistry::is_watcher_authorized_for`] to
     /// return `true` only for the listed targets.
     ///
-    /// Does not require `watcher` to be currently registered: operators can
-    /// pre-configure scope before `register_watcher`.
+    /// `watcher` must be currently registered, and `scope` is capped at
+    /// [`MAX_SCOPE_LEN`] entries. The scope is stored in persistent storage
+    /// with its TTL extended on every write.
     ///
     /// # Auth
     /// Requires a valid Stellar auth signature from `admin`, who must be an
@@ -891,6 +950,9 @@ impl WatcherRegistry {
     /// # Errors
     /// Returns [`ContractError::NotInitialized`] if the contract has not been initialized.
     /// Returns [`ContractError::Unauthorized`] if the caller is not authorized for this operation.
+    /// Returns [`ContractError::Paused`] if the registry is paused.
+    /// Returns [`ContractError::WatcherNotFound`] if `watcher` is not registered.
+    /// Returns [`ContractError::ScopeTooLong`] if `scope` exceeds [`MAX_SCOPE_LEN`].
     /// # Events
     /// Emits `("watcher", "scope")` with data `(watcher: Address, scope: Vec<Address>)`.
     pub fn set_watcher_scope(
@@ -901,10 +963,20 @@ impl WatcherRegistry {
     ) -> Result<(), ContractError> {
         admin.require_auth();
         Self::assert_admin(&env, &admin)?;
+        Self::assert_not_paused(&env)?;
 
+        if !Self::is_watcher_authorized(env.clone(), watcher.clone()) {
+            return Err(ContractError::WatcherNotFound);
+        }
+        if scope.len() > MAX_SCOPE_LEN {
+            return Err(ContractError::ScopeTooLong);
+        }
+
+        let key = DataKey::WatcherScope(watcher.clone());
+        env.storage().persistent().set(&key, &scope);
         env.storage()
-            .instance()
-            .set(&DataKey::WatcherScope(watcher.clone()), &scope);
+            .persistent()
+            .extend_ttl(&key, DEFAULT_TTL, MAX_TTL);
 
         env.events().publish(
             (symbol_short!("watcher"), symbol_short!("scope")),
@@ -925,8 +997,10 @@ impl WatcherRegistry {
     /// Set (or clear, with `None`) optional off-chain-identifying metadata
     /// for `watcher` (admin-only).
     ///
-    /// Purely informational: carries no authorization weight and does not
-    /// require `watcher` to be currently registered.
+    /// Purely informational: carries no authorization weight. `watcher` must
+    /// be currently registered, `label` is capped at [`MAX_LABEL_LEN`] bytes
+    /// and `operator` at [`MAX_OPERATOR_LEN`] bytes. Metadata is stored in
+    /// persistent storage with its TTL extended on every write.
     ///
     /// # Auth
     /// Requires a valid Stellar auth signature from `admin`, who must be an
@@ -934,6 +1008,10 @@ impl WatcherRegistry {
     /// # Errors
     /// Returns [`ContractError::NotInitialized`] if the contract has not been initialized.
     /// Returns [`ContractError::Unauthorized`] if the caller is not authorized for this operation.
+    /// Returns [`ContractError::Paused`] if the registry is paused.
+    /// Returns [`ContractError::WatcherNotFound`] if `watcher` is not registered.
+    /// Returns [`ContractError::LabelTooLong`] if `info.label` exceeds [`MAX_LABEL_LEN`].
+    /// Returns [`ContractError::OperatorTooLong`] if `info.operator` exceeds [`MAX_OPERATOR_LEN`].
     /// # Events
     /// Emits `("watcher", "info")` with data `(watcher: Address, label: String, operator: String)`.
     pub fn set_watcher_info(
@@ -944,21 +1022,32 @@ impl WatcherRegistry {
     ) -> Result<(), ContractError> {
         admin.require_auth();
         Self::assert_admin(&env, &admin)?;
+        Self::assert_not_paused(&env)?;
 
+        if !Self::is_watcher_authorized(env.clone(), watcher.clone()) {
+            return Err(ContractError::WatcherNotFound);
+        }
+
+        let key = DataKey::WatcherInfo(watcher.clone());
         match info {
             Some(info) => {
+                if info.label.len() > MAX_LABEL_LEN {
+                    return Err(ContractError::LabelTooLong);
+                }
+                if info.operator.len() > MAX_OPERATOR_LEN {
+                    return Err(ContractError::OperatorTooLong);
+                }
                 env.events().publish(
                     (symbol_short!("watcher"), symbol_short!("info")),
-                    (watcher.clone(), info.label.clone(), info.operator.clone()),
+                    (watcher, info.label.clone(), info.operator.clone()),
                 );
+                env.storage().persistent().set(&key, &info);
                 env.storage()
-                    .instance()
-                    .set(&DataKey::WatcherInfo(watcher), &info);
+                    .persistent()
+                    .extend_ttl(&key, DEFAULT_TTL, MAX_TTL);
             }
             None => {
-                env.storage()
-                    .instance()
-                    .remove(&DataKey::WatcherInfo(watcher));
+                env.storage().persistent().remove(&key);
             }
         }
 
@@ -967,10 +1056,39 @@ impl WatcherRegistry {
 
     /// Get the optional metadata stored for `watcher` via [`WatcherRegistry::set_watcher_info`].
     ///
-    /// Returns `None` if no metadata has been set.
+    /// Returns `None` if no metadata has been set. Reads from persistent
+    /// storage and extends the entry's TTL when present.
     #[must_use]
     pub fn get_watcher_info(env: Env, watcher: Address) -> Option<WatcherInfo> {
-        env.storage().instance().get(&DataKey::WatcherInfo(watcher))
+        let key = DataKey::WatcherInfo(watcher);
+        let info: Option<WatcherInfo> = env.storage().persistent().get(&key);
+        if info.is_some() {
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, DEFAULT_TTL, MAX_TTL);
+        }
+        info
+    }
+
+    /// Return a one-shot snapshot of the registry's configuration.
+    ///
+    /// Aggregates [`WatcherRegistry::get_admins`], [`WatcherRegistry::is_paused`],
+    /// [`WatcherRegistry::get_timelock_delay`], [`WatcherRegistry::get_pending_action`],
+    /// [`WatcherRegistry::get_pending_admin_transfer`] and
+    /// [`WatcherRegistry::get_watcher_count`] into a single call so dashboards
+    /// need only one simulation.
+    /// # Errors
+    /// Returns [`ContractError::NotInitialized`] if the contract has not been initialized.
+    pub fn get_configuration(env: Env) -> Result<WatcherRegistryConfiguration, ContractError> {
+        let admins = Self::get_admins(env.clone())?;
+        Ok(WatcherRegistryConfiguration {
+            admins,
+            paused: Self::is_paused(env.clone()),
+            timelock_delay: Self::timelock_delay(&env),
+            pending_action: Self::get_pending_action(env.clone()),
+            pending_admin_transfer: Self::get_pending_admin_transfer(env.clone()),
+            watcher_count: Self::get_watcher_count(env),
+        })
     }
 
     /// Check authorization for a batch of addresses in a single call.
@@ -3633,6 +3751,194 @@ mod tests {
         // Watchers are untouched since the action was never queued.
         assert_eq!(client.get_watchers().len(), 2);
         assert_eq!(client.get_watcher_count(), 2);
+    }
+
+    // ── #593: watcher metadata / scope limits and pause checks ───────────────
+
+    #[test]
+    fn test_set_watcher_info_rejects_unregistered_watcher() {
+        let (env, admin, client) = setup();
+        let watcher = Address::generate(&env);
+        let info = WatcherInfo {
+            label: String::from_str(&env, "node-1"),
+            operator: String::from_str(&env, "acme"),
+        };
+
+        assert_eq!(
+            client
+                .try_set_watcher_info(&admin, &watcher, &Some(info))
+                .unwrap_err()
+                .unwrap(),
+            ContractError::WatcherNotFound
+        );
+    }
+
+    #[test]
+    fn test_set_watcher_scope_rejects_unregistered_watcher() {
+        let (env, admin, client) = setup();
+        let watcher = Address::generate(&env);
+        let target = Address::generate(&env);
+
+        assert_eq!(
+            client
+                .try_set_watcher_scope(&admin, &watcher, &vec![&env, target])
+                .unwrap_err()
+                .unwrap(),
+            ContractError::WatcherNotFound
+        );
+    }
+
+    #[test]
+    fn test_set_watcher_info_rejects_oversized_label() {
+        let (env, admin, client) = setup();
+        let watcher = Address::generate(&env);
+        client.register_watcher(&admin, &watcher);
+
+        let mut label = String::from_str(&env, "");
+        for _ in 0..=MAX_LABEL_LEN {
+            label.push_str("a");
+        }
+        let info = WatcherInfo {
+            label,
+            operator: String::from_str(&env, "acme"),
+        };
+
+        assert_eq!(
+            client
+                .try_set_watcher_info(&admin, &watcher, &Some(info))
+                .unwrap_err()
+                .unwrap(),
+            ContractError::LabelTooLong
+        );
+    }
+
+    #[test]
+    fn test_set_watcher_info_rejects_oversized_operator() {
+        let (env, admin, client) = setup();
+        let watcher = Address::generate(&env);
+        client.register_watcher(&admin, &watcher);
+
+        let mut operator = String::from_str(&env, "");
+        for _ in 0..=MAX_OPERATOR_LEN {
+            operator.push_str("a");
+        }
+        let info = WatcherInfo {
+            label: String::from_str(&env, "node-1"),
+            operator,
+        };
+
+        assert_eq!(
+            client
+                .try_set_watcher_info(&admin, &watcher, &Some(info))
+                .unwrap_err()
+                .unwrap(),
+            ContractError::OperatorTooLong
+        );
+    }
+
+    #[test]
+    fn test_set_watcher_info_accepts_max_lengths() {
+        let (env, admin, client) = setup();
+        let watcher = Address::generate(&env);
+        client.register_watcher(&admin, &watcher);
+
+        let mut label = String::from_str(&env, "");
+        let mut operator = String::from_str(&env, "");
+        for _ in 0..MAX_LABEL_LEN {
+            label.push_str("a");
+        }
+        for _ in 0..MAX_OPERATOR_LEN {
+            operator.push_str("b");
+        }
+        let info = WatcherInfo {
+            label: label.clone(),
+            operator: operator.clone(),
+        };
+
+        assert_eq!(
+            client
+                .try_set_watcher_info(&admin, &watcher, &Some(info))
+                .unwrap(),
+            Ok(())
+        );
+        let stored = client.get_watcher_info(&watcher).unwrap();
+        assert_eq!(stored.label, label);
+        assert_eq!(stored.operator, operator);
+    }
+
+    #[test]
+    fn test_set_watcher_scope_rejects_oversized_scope() {
+        let (env, admin, client) = setup();
+        let watcher = Address::generate(&env);
+        client.register_watcher(&admin, &watcher);
+
+        let mut scope: Vec<Address> = vec![&env];
+        for _ in 0..=MAX_SCOPE_LEN {
+            scope.push_back(Address::generate(&env));
+        }
+
+        assert_eq!(
+            client
+                .try_set_watcher_scope(&admin, &watcher, &scope)
+                .unwrap_err()
+                .unwrap(),
+            ContractError::ScopeTooLong
+        );
+    }
+
+    #[test]
+    fn test_set_watcher_info_and_scope_rejected_when_paused() {
+        let (env, admin, client) = setup();
+        let watcher = Address::generate(&env);
+        let target = Address::generate(&env);
+        client.register_watcher(&admin, &watcher);
+        client.pause(&admin);
+
+        let info = WatcherInfo {
+            label: String::from_str(&env, "node-1"),
+            operator: String::from_str(&env, "acme"),
+        };
+        assert_eq!(
+            client
+                .try_set_watcher_info(&admin, &watcher, &Some(info))
+                .unwrap_err()
+                .unwrap(),
+            ContractError::Paused
+        );
+        assert_eq!(
+            client
+                .try_set_watcher_scope(&admin, &watcher, &vec![&env, target])
+                .unwrap_err()
+                .unwrap(),
+            ContractError::Paused
+        );
+    }
+
+    // ── #602: get_configuration ──────────────────────────────────────────────
+
+    #[test]
+    fn test_get_configuration_aggregates_state() {
+        let (env, admin, client) = setup();
+        let watcher = Address::generate(&env);
+        client.register_watcher(&admin, &watcher);
+        client.set_timelock_delay(&admin, &TEST_DELAY);
+
+        let config = client.get_configuration();
+        assert_eq!(config.admins, client.get_admins());
+        assert!(!config.paused);
+        assert_eq!(config.timelock_delay, TEST_DELAY);
+        assert!(config.pending_action.is_none());
+        assert!(config.pending_admin_transfer.is_none());
+        assert_eq!(config.watcher_count, 1);
+    }
+
+    #[test]
+    fn test_get_configuration_before_initialize() {
+        let (_env, client) = uninit();
+        assert_eq!(
+            client.try_get_configuration().unwrap_err().unwrap(),
+            ContractError::NotInitialized
+        );
     }
 
     // 34. register_watchers emits one event per newly-added watcher
