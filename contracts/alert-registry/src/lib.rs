@@ -4133,6 +4133,18 @@ impl AlertRegistry {
         if storage.has(&suspended_key) {
             storage.extend_ttl(&suspended_key, ttl, ttl);
         }
+        // Side keys must outlive the alert, or tags/snooze/expiry and a staged
+        // webhook proposal silently vanish before the alert does.
+        for side_key in [
+            DataKey::AlertTags(config_id),
+            DataKey::SnoozeUntil(config_id),
+            DataKey::AlertExpiry(config_id),
+            DataKey::WebhookProposalLedger(config_id),
+        ] {
+            if storage.has(&side_key) {
+                storage.extend_ttl(&side_key, ttl, ttl);
+            }
+        }
     }
 
     /// Atomically read and increment the global alert ID counter.
