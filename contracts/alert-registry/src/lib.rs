@@ -816,12 +816,6 @@ impl AlertRegistry {
             .instance()
             .get(&instance_key::ADMIN)
             .ok_or(ContractError::NotInitialized)?;
-
-        let old_admin: Address = env
-            .storage()
-            .instance()
-            .get(&instance_key::ADMIN)
-            .ok_or(ContractError::NotInitialized)?;
         env.storage()
             .instance()
             .set(&instance_key::ADMIN, &new_admin);
@@ -867,8 +861,6 @@ impl AlertRegistry {
             .remove(&DataKey::PendingAdminTransfer);
         Self::extend_instance_ttl(&env);
 
-        env.events()
-            .publish((symbol_short!("admin"), symbol_short!("cancel")), admin);
         env.events().publish(
             (symbol_short!("admin"), symbol_short!("cancel")),
             (admin,),
