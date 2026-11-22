@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — alert-registry error-code collisions
+
+- `ContractError` codes that collided are reassigned: `AdminTransferExpired` 24 → 34, `NotAGuardian` 24 → 35, `TooManyTags` 30 → 36. `NotGuardian` keeps 24 and `RevisionMismatch` keeps 30.
+
 ### Changed — npm package names
 
 - **TypeScript bindings renamed to `@tx-wats/<contract>-bindings`.** The scope now matches the GitHub org (`Tx-wats`) and both packages share the `-bindings` suffix: `@tx-wat/alert-registry-bindings` → `@tx-wats/alert-registry-bindings`, and `@tx-wat/watcher-registry` → `@tx-wats/watcher-registry-bindings`. Nothing was published under the old names.

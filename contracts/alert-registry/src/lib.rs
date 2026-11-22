@@ -352,10 +352,10 @@ pub enum ContractError {
     EmptyRules = 25,
     /// Returned by `accept_admin_transfer` when the pending admin transfer is
     /// past its expiry ledger.
-    AdminTransferExpired = 24,
+    AdminTransferExpired = 34,
     /// Returned by `pause` when called by an address that is neither the
     /// admin nor the configured guardian.
-    NotAGuardian = 24,
+    NotAGuardian = 35,
     /// Returned by `confirm_webhook` when the pending webhook rotation was
     /// proposed more than [`WEBHOOK_PROPOSAL_EXPIRY_LEDGERS`] ledgers ago.
     WebhookProposalExpired = 29,
@@ -366,7 +366,7 @@ pub enum ContractError {
     RevisionMismatch = 30,
     /// Returned by `set_alert_tags` when more than [`MAX_TAGS_PER_ALERT`] tags
     /// are supplied.
-    TooManyTags = 30,
+    TooManyTags = 36,
     /// Returned by `set_alert_tags` when a tag is empty or exceeds
     /// [`MAX_TAG_LEN`] bytes.
     InvalidTag = 31,
