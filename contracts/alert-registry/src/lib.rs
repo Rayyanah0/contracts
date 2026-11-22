@@ -3033,17 +3033,6 @@ impl AlertRegistry {
     /// Dangling IDs (alerts whose storage entry has expired or been removed)
     /// are filtered out, so every returned ID corresponds to a live alert.
     ///
-    /// Returns an empty vec if `owner` has no registered alerts.
-    #[must_use]
-    pub fn get_alert_ids_by_owner(env: Env, owner: Address) -> Vec<u64> {
-        let ids = Self::owner_index(&env, &owner);
-        ids.into_iter()
-            .filter(|id| {
-                env.storage()
-                    .persistent()
-                    .has(&DataKey::Alert(*id))
-            })
-            .collect()
     /// Returns an empty vec if `owner` has no live registered alerts.
     #[must_use]
     pub fn get_alert_ids_by_owner(env: Env, owner: Address) -> Vec<u64> {
