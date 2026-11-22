@@ -3117,6 +3117,15 @@ impl AlertRegistry {
     /// Returns [`ContractError::NotAWatcher`] if a watcher registry is configured
     /// and `querier` is not a registered watcher.
     pub fn get_active_contract_alerts_paginated(
+        env: Env,
+        querier: Address,
+        target_contract: Address,
+        offset: u32,
+        limit: u32,
+    ) -> Result<Vec<AlertConfig>, ContractError> {
+        Self::get_active_contract_alerts_paged(env, querier, target_contract, offset, limit)
+    }
+
     /// Get a page of **active** alert configs for a target contract.
     ///
     /// The bounded, paginated replacement for
