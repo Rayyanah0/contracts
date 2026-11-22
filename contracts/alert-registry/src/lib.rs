@@ -3502,41 +3502,6 @@ impl AlertRegistry {
     /// advancing `offset` by `limit` until it reaches `get_alert_count()`;
     /// a short or empty result page does not indicate that the scan is complete.
     #[must_use]
-    pub fn get_alerts_modified_since(
-        env: Env,
-        since: u64,
-        offset: u32,
-        limit: u32,
-    ) -> Vec<AlertConfig> {
-        let total: u64 = env
-            .storage()
-            .instance()
-            .get(&instance_key::NEXT_ID)
-            .unwrap_or(0u64);
-
-        let range_start = u64::from(offset).min(total);
-        let range_end = u64::from(offset)
-            .saturating_add(u64::from(limit.min(MAX_PAGE_SIZE)))
-            .min(total);
-
-        let mut out: Vec<AlertConfig> = vec![&env];
-        for id in range_start..range_end {
-            if let Some(cfg) = env
-                .storage()
-                .persistent()
-                .get::<DataKey, AlertConfig>(&DataKey::Alert(id))
-                .or_else(|| {
-                    env.storage()
-                        .persistent()
-                        .get::<DataKey, AlertConfig>(&DataKey::RemovedAlert(id))
-                })
-            {
-                if cfg.updated_at >= since {
-                    out.push_back(cfg);
-                }
-            }
-        }
-        out
     pub fn get_alerts_modified_since(env: Env, since: u64, offset: u32, limit: u32) -> Vec<AlertConfig> {
         Self::scan_alerts_modified(&env, offset, limit, |cfg| cfg.updated_at >= since)
     }
