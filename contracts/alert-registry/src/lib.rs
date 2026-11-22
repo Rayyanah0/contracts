@@ -900,7 +900,6 @@ impl AlertRegistry {
         admin.require_auth();
         Self::assert_admin(&env, &admin)?;
 
-        env.deployer().update_current_contract_wasm(new_wasm_hash.clone());
         env.deployer()
             .update_current_contract_wasm(new_wasm_hash.clone());
         env.events().publish(
