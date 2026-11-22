@@ -1035,10 +1035,6 @@ impl AlertRegistry {
             env.events()
                 .publish((symbol_short!("admin"), symbol_short!("unpause")), admin);
         }
-        env.storage().instance().set(&instance_key::PAUSED, &false);
-        Self::extend_instance_ttl(&env);
-        env.events()
-            .publish((symbol_short!("admin"), symbol_short!("unpause")), (admin,));
         Ok(())
     }
 
