@@ -199,6 +199,8 @@ jobs:
         run: bash scripts/check-events-doc.sh
       - name: Check storage documentation
         run: python3 scripts/check_storage_doc.py
+      - name: Check function documentation
+        run: python3 scripts/check_function_docs.py
 
   # Issue #103, #282 — Code coverage reporting on pinned toolchain with llvm-tools-preview
   coverage:
