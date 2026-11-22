@@ -1352,7 +1352,7 @@ impl WatcherRegistry {
     /// Returns [`ContractError::MaxAdminsReached`] if `action` is [`AdminAction::AddAdmin`] and the admin set is full.
     /// Returns [`ContractError::BelowMinWatchers`] if `action` is [`AdminAction::ClearAllWatchers`] and the registry is non-empty.
     /// Returns [`ContractError::DelayTooLarge`] if `action` is [`AdminAction::SetTimelockDelay`] above [`MAX_TIMELOCK_DELAY`].
-    /// Returns [`ContractError::TimelockRequired`] if `action` is [`AdminAction::SetTimelockDelay`] below the current delay.
+    /// Lowering the delay is allowed here: it is itself a timelocked change.
     ///
     /// Note: [`AdminAction::Upgrade`] is not pre-validated here — whether a
     /// WASM hash is installed is a host-level check that
@@ -1391,9 +1391,6 @@ impl WatcherRegistry {
             AdminAction::SetTimelockDelay(delay) => {
                 if *delay > MAX_TIMELOCK_DELAY {
                     return Err(ContractError::DelayTooLarge);
-                }
-                if *delay < Self::timelock_delay(&env) {
-                    return Err(ContractError::TimelockRequired);
                 }
             }
             AdminAction::TransferAdmin(_) | AdminAction::Upgrade(_) => {}
