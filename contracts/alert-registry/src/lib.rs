@@ -962,7 +962,7 @@ impl AlertRegistry {
             per_contract_alert_limit: Self::get_per_contract_alert_limit(env.clone()),
             global_alert_limit: Self::get_global_alert_limit(env.clone()),
             watcher_registry: Self::get_watcher_registry(env.clone()),
-            pending_admin: Self::get_pending_admin_transfer(env),
+            pending_admin: Self::get_pending_admin_transfer(env.clone()),
             guardian: Self::get_guardian(env),
         })
     }
