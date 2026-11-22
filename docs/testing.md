@@ -8,6 +8,17 @@ cargo test
 make test
 ```
 
+## Coverage Floor
+
+CI's `coverage` job fails if line coverage drops below **60%** for either contract crate:
+
+```bash
+cargo llvm-cov -p alert-registry --locked --fail-under-lines 60
+cargo llvm-cov -p watcher-registry --locked --fail-under-lines 60
+```
+
+The Codecov upload stays non-blocking (`fail_ci_if_error: false`); the floor is enforced by the `cargo llvm-cov` steps. The 60% value is a provisional threshold, not a measured baseline. Raise it once the current per-crate line coverage is known.
+
 ## Test Setup Pattern
 
 Both contracts use the same setup helper pattern:
