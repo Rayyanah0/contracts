@@ -1330,55 +1330,6 @@ impl AlertRegistry {
         env.storage().instance().get(&instance_key::WATCHREG)
     }
 
-    /// Set (or clear) the optional guardian address (admin only).
-    ///
-    /// The guardian is an on-call operator or monitoring bot that may trip the
-    /// circuit-breaker with [`AlertRegistry::pause`] but can never
-    /// [`AlertRegistry::unpause`] or perform any other admin action. This lets
-    /// a low-trust key respond to incidents without also holding the power to
-    /// upgrade the contract or change limits.
-    ///
-    /// Passing `None` clears the guardian.
-    ///
-    /// # Auth
-    /// Requires a valid Stellar auth signature from `admin`.
-    ///
-    /// # Errors
-    /// Returns [`ContractError::NotInitialized`] if the contract has not been
-    /// initialized.
-    /// Returns [`ContractError::Unauthorized`] if `admin` is not the admin.
-    /// Returns [`ContractError::Paused`] while the contract is paused.
-    ///
-    /// # Events
-    /// Emits `(Symbol("admin"), Symbol("guardian"))` with data
-    /// `(admin: Address, guardian: Option<Address>)`.
-    pub fn set_guardian(
-        env: Env,
-        admin: Address,
-        guardian: Option<Address>,
-    ) -> Result<(), ContractError> {
-        admin.require_auth();
-        Self::assert_admin(&env, &admin)?;
-        Self::assert_not_paused(&env)?;
-
-        match &guardian {
-            Some(g) => env.storage().instance().set(&instance_key::GUARDIAN, g),
-            None => env.storage().instance().remove(&instance_key::GUARDIAN),
-        }
-        Self::extend_instance_ttl(&env);
-
-        env.events().publish(
-            (symbol_short!("admin"), symbol_short!("guardian")),
-            (admin, guardian),
-        );
-        Ok(())
-    }
-
-    /// Return the configured guardian address, or `None` if none is set.
-    pub fn get_guardian(env: Env) -> Option<Address> {
-        env.storage().instance().get(&instance_key::GUARDIAN)
-    }
-
     /// Set (or clear) the optional ledger at which an alert automatically
     /// stops being considered active.
     ///
