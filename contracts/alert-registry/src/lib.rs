@@ -375,6 +375,9 @@ pub enum ContractError {
     SchemaVersionMismatch = 32,
     /// Returned by `migrate` when `to` is not strictly greater than `from`.
     InvalidSchemaVersion = 33,
+    /// Returned by `set_alert_expiry` when `active_until_ledger` is at or before
+    /// the current ledger sequence (instantly expired).
+    InvalidAlertExpiry = 34,
 }
 
 // ── Data types ───────────────────────────────────────────────────────────────
@@ -1417,12 +1420,18 @@ impl AlertRegistry {
         caller.require_auth();
         Self::assert_not_paused(&env)?;
 
-        let config = Self::load_alert(&env, config_id)?;
+        let mut config = Self::load_alert(&env, config_id)?;
         Self::assert_owner(&config, &caller)?;
+
+        config.updated_at = env.ledger().timestamp();
+        config.updated_ledger = env.ledger().sequence();
 
         let key = DataKey::AlertExpiry(config_id);
         match active_until_ledger {
             Some(ledger) => {
+                if ledger <= env.ledger().sequence() {
+                    return Err(ContractError::InvalidAlertExpiry);
+                }
                 env.storage().persistent().set(&key, &ledger);
                 env.storage()
                     .persistent()
@@ -1430,6 +1439,8 @@ impl AlertRegistry {
             }
             None => env.storage().persistent().remove(&key),
         }
+
+        Self::persist_alert(&env, config_id, &config);
 
         env.events().publish(
             (symbol_short!("alert"), symbol_short!("expiry")),
@@ -2384,11 +2395,15 @@ impl AlertRegistry {
         admin.require_auth();
         Self::assert_admin(&env, &admin)?;
         Self::assert_not_paused(&env)?;
-        Self::load_alert(&env, config_id)?;
+        let mut config = Self::load_alert(&env, config_id)?;
+
+        config.updated_at = env.ledger().timestamp();
+        config.updated_ledger = env.ledger().sequence();
 
         let key = DataKey::AdminSuspended(config_id);
         if env.storage().persistent().has(&key) {
             env.storage().persistent().remove(&key);
+            Self::persist_alert(&env, config_id, &config);
             env.events().publish(
                 (symbol_short!("alert"), symbol_short!("admin_on")),
                 (config_id, admin),
@@ -2827,7 +2842,7 @@ impl AlertRegistry {
         caller.require_auth();
         Self::assert_not_paused(&env)?;
 
-        let config: AlertConfig = env
+        let mut config: AlertConfig = env
             .storage()
             .persistent()
             .get(&DataKey::Alert(config_id))
@@ -2844,11 +2859,16 @@ impl AlertRegistry {
             }
         }
 
+        config.updated_at = env.ledger().timestamp();
+        config.updated_ledger = env.ledger().sequence();
+
         let key = DataKey::AlertTags(config_id);
         env.storage().persistent().set(&key, &tags);
         env.storage()
             .persistent()
             .extend_ttl(&key, DEFAULT_TTL, DEFAULT_TTL);
+
+        Self::persist_alert(&env, config_id, &config);
 
         env.events().publish(
             (symbol_short!("alert"), symbol_short!("tags")),
@@ -2899,12 +2919,15 @@ impl AlertRegistry {
         caller.require_auth();
         Self::assert_not_paused(&env)?;
 
-        let config: AlertConfig = env
+        let mut config: AlertConfig = env
             .storage()
             .persistent()
             .get(&DataKey::Alert(config_id))
             .ok_or(ContractError::AlertNotFound)?;
         Self::assert_owner(&config, &caller)?;
+
+        config.updated_at = env.ledger().timestamp();
+        config.updated_ledger = env.ledger().sequence();
 
         let key = DataKey::SnoozeUntil(config_id);
         if until_ledger <= env.ledger().sequence() {
@@ -2915,6 +2938,8 @@ impl AlertRegistry {
                 .persistent()
                 .extend_ttl(&key, DEFAULT_TTL, DEFAULT_TTL);
         }
+
+        Self::persist_alert(&env, config_id, &config);
 
         env.events().publish(
             (symbol_short!("alert"), symbol_short!("snooze")),
@@ -4061,6 +4086,18 @@ impl AlertRegistry {
         env.storage()
             .persistent()
             .remove(&DataKey::AlertTarget(config_id));
+        env.storage()
+            .persistent()
+            .remove(&DataKey::AlertExpiry(config_id));
+        env.storage()
+            .persistent()
+            .remove(&DataKey::AlertTags(config_id));
+        env.storage()
+            .persistent()
+            .remove(&DataKey::SnoozeUntil(config_id));
+        env.storage()
+            .persistent()
+            .remove(&DataKey::WebhookProposalLedger(config_id));
 
         Self::remove_from_owner_index(env, &config.owner, config_id);
         Self::remove_from_contract_index(env, &config.target_contract, config_id);
@@ -4132,6 +4169,22 @@ impl AlertRegistry {
         let suspended_key = DataKey::AdminSuspended(config_id);
         if storage.has(&suspended_key) {
             storage.extend_ttl(&suspended_key, ttl, ttl);
+        }
+        let expiry_key = DataKey::AlertExpiry(config_id);
+        if storage.has(&expiry_key) {
+            storage.extend_ttl(&expiry_key, ttl, ttl);
+        }
+        let tags_key = DataKey::AlertTags(config_id);
+        if storage.has(&tags_key) {
+            storage.extend_ttl(&tags_key, ttl, ttl);
+        }
+        let snooze_key = DataKey::SnoozeUntil(config_id);
+        if storage.has(&snooze_key) {
+            storage.extend_ttl(&snooze_key, ttl, ttl);
+        }
+        let webhook_key = DataKey::WebhookProposalLedger(config_id);
+        if storage.has(&webhook_key) {
+            storage.extend_ttl(&webhook_key, ttl, ttl);
         }
     }
 
