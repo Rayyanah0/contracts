@@ -89,6 +89,99 @@ The system is centered around three data-flow steps:
 
 This keeps alert configuration on-chain while letting watcher nodes perform off-chain polling and delivery.
 
+## Feature overview
+
+One CLI example per feature beyond basic register/update/remove. Full function lists are in the [Invoking Contracts](#invoking-contracts-stellar-cli) cheatsheet below.
+
+**Snooze an alert** until a ledger sequence. The alert stays active, but active-filtered reads skip it until then. Pass a past or current ledger to end the snooze early:
+
+```bash
+stellar contract invoke \
+  --id <ALERT_REGISTRY_CONTRACT_ID> \
+  --source <OWNER_IDENTITY> \
+  --network testnet \
+  -- snooze_alert \
+  --caller <OWNER_ADDRESS> \
+  --config_id 1 \
+  --until_ledger 1234567
+```
+
+**Tag an alert** (e.g. `prod`, `treasury`). Replaces all existing tags; pass `[]` to clear:
+
+```bash
+stellar contract invoke \
+  --id <ALERT_REGISTRY_CONTRACT_ID> \
+  --source <OWNER_IDENTITY> \
+  --network testnet \
+  -- set_alert_tags \
+  --caller <OWNER_ADDRESS> \
+  --config_id 1 \
+  --tags '["prod","treasury"]'
+```
+
+**Expire an alert** automatically at a ledger. Omit `--active_until_ledger` to clear the expiry:
+
+```bash
+stellar contract invoke \
+  --id <ALERT_REGISTRY_CONTRACT_ID> \
+  --source <OWNER_IDENTITY> \
+  --network testnet \
+  -- set_alert_expiry \
+  --caller <OWNER_ADDRESS> \
+  --config_id 1 \
+  --active_until_ledger 1234567
+```
+
+**Remove all of your alerts.** Each call removes a bounded batch and returns the number processed; call again until it returns `0`:
+
+```bash
+stellar contract invoke \
+  --id <ALERT_REGISTRY_CONTRACT_ID> \
+  --source <OWNER_IDENTITY> \
+  --network testnet \
+  -- remove_all_alerts \
+  --caller <OWNER_ADDRESS>
+```
+
+**Set the pause-only guardian** (admin only). The guardian can call `pause` but never `unpause`:
+
+```bash
+stellar contract invoke \
+  --id <ALERT_REGISTRY_CONTRACT_ID> \
+  --source <ADMIN_IDENTITY> \
+  --network testnet \
+  -- set_guardian \
+  --admin <ADMIN_ADDRESS> \
+  --guardian <GUARDIAN_ADDRESS>
+```
+
+**Migrate the schema** (admin only). Pass `from` as the current version from `get_schema_version`, and feed the returned cursor back in until the version reads `to`:
+
+```bash
+stellar contract invoke \
+  --id <ALERT_REGISTRY_CONTRACT_ID> \
+  --source <ADMIN_IDENTITY> \
+  --network testnet \
+  -- migrate \
+  --caller <ADMIN_ADDRESS> \
+  --from 1 \
+  --to 2 \
+  --cursor 0
+```
+
+**Scope a watcher** (admin only) to specific target contracts. An empty list removes the restriction:
+
+```bash
+stellar contract invoke \
+  --id <WATCHER_REGISTRY_CONTRACT_ID> \
+  --source <ADMIN_IDENTITY> \
+  --network testnet \
+  -- set_watcher_scope \
+  --admin <ADMIN_ADDRESS> \
+  --watcher <WATCHER_ADDRESS> \
+  --scope '["<WATCHED_CONTRACT_ADDRESS>"]'
+```
+
 ## Stellar Integration
 
 ### Network Configuration
