@@ -1676,11 +1676,10 @@ impl AlertRegistry {
     /// so a client cannot accidentally clear its rules with an empty vector.
     ///
     /// # Events
-    /// Emits `(Symbol("alert"), Symbol("active"))` with data
+    /// Emits `(Symbol("alert"), Symbol("act_set"))` with data
     /// `(id: u64, owner: Address, active: bool)`. Off-chain indexers can use
     /// this topic to detect activation toggles without re-fetching the alert.
-    /// Emits `(Symbol("alert"), Symbol("act_set"))` with data
-    /// `(id: u64, owner: Address, active: bool)`. This topic is distinct from
+    /// This topic is distinct from
     /// the `update` topic [`AlertRegistry::update_alert`] emits, so an indexer
     /// can tell a pure activation toggle from a rules rewrite.
     ///
@@ -1752,7 +1751,6 @@ impl AlertRegistry {
         // tell an activation toggle (rules unchanged) from a rules rewrite
         // without re-fetching the alert (#382).
         env.events().publish(
-            (symbol_short!("alert"), symbol_short!("active")),
             (symbol_short!("alert"), symbol_short!("act_set")),
             (config_id, config.owner, active),
         );
