@@ -1,7 +1,7 @@
 use super::*;
 use soroban_sdk::{
     testutils::{Address as _, Events as _},
-    Address, Env, FromVal,
+    Address, Env, FromVal, Symbol,
 };
 
 fn setup() -> (Env, Address, WatcherRegistryClient<'static>) {
@@ -11,6 +11,24 @@ fn setup() -> (Env, Address, WatcherRegistryClient<'static>) {
     let contract_id = env.register(WatcherRegistry, (&admin,));
     let client = WatcherRegistryClient::new(&env, &contract_id);
     (env, admin, client)
+}
+
+/// Number of contract events whose two leading topics are `(t0, t1)`.
+///
+/// Regression tests reason about a specific event kind this way rather than
+/// counting every event: `setup()` deploys the contract through
+/// `__constructor`, which emits an `("admin", "init")` event, so
+/// `env.events().all()` is never empty right after setup.
+fn count_events(env: &Env, t0: &Symbol, t1: &Symbol) -> usize {
+    env.events()
+        .all()
+        .iter()
+        .filter(|(_, topics, _)| {
+            topics.len() == 2
+                && Symbol::from_val(env, &topics.get(0).unwrap()) == *t0
+                && Symbol::from_val(env, &topics.get(1).unwrap()) == *t1
+        })
+        .count()
 }
 
 /// Regression test for historical bug:
@@ -89,21 +107,26 @@ fn test_regression_remove_watcher_unregistered_emits_no_event() {
         Ok(())
     );
 
-    let events = env.events().all();
+    // Removing an unregistered watcher is a silent no-op: no ("watcher",
+    // "remove") event is emitted. Counting the specific topic (rather than all
+    // events) ignores the constructor's `("admin","init")` event from setup.
     assert_eq!(
-        events.events().len(),
+        count_events(
+            &env,
+            &soroban_sdk::symbol_short!("watcher"),
+            &soroban_sdk::symbol_short!("remove")
+        ),
         0,
-        "No event should be emitted when removing an unregistered watcher"
+        "No remove event should be emitted when removing an unregistered watcher"
     );
 }
 
 /// Regression test for historical bug:
-/// `clear_all_watchers emits one event per removed watcher.`
-///
-/// Ensures that clearing all watchers emits individual `("watcher", "remove")`
-/// events for all removed addresses so off-chain systems immediately revoke trust.
+/// `clear_all_watchers` must refuse (not silently no-op) when the registry is
+/// non-empty and `MIN_WATCHERS` is greater than zero, leaving the watchers —
+/// and the trust they carry — intact instead of dropping below the floor.
 #[test]
-fn test_regression_clear_all_watchers_emits_one_event_per_removed_watcher() {
+fn test_regression_clear_all_watchers_refuses_non_empty_under_min_watchers() {
     let (env, admin, client) = setup();
     let w1 = Address::generate(&env);
     let w2 = Address::generate(&env);
@@ -112,38 +135,16 @@ fn test_regression_clear_all_watchers_emits_one_event_per_removed_watcher() {
     client.register_watcher(&admin, &w2);
     assert_eq!(client.get_watcher_count(), 2);
 
-    client.clear_all_watchers(&admin);
-
-    let events = env.events().all();
-    let events = events.events();
-    // Should have emitted 2 remove events (one for each removed watcher)
-    assert_eq!(events.len(), 2);
-    for event in events.iter() {
-        let v0 = match &event.body {
-            soroban_sdk::xdr::ContractEventBody::V0(v0) => v0,
-        };
-        assert_eq!(v0.topics.len(), 2);
-        let emitted_addr: Address = soroban_sdk::TryFromVal::try_from_val(&env, &v0.data)
-            .expect("event data decodes as an address");
-        assert!(emitted_addr == w1 || emitted_addr == w2);
-    let mut removed = 0;
-    for i in 0..events.len() {
-        let (_, topics, data) = events.get(i).unwrap();
-        if topics.len() == 2
-            && soroban_sdk::Symbol::from_val(&env, &topics.get(0).unwrap())
-                == soroban_sdk::symbol_short!("watcher")
-            && soroban_sdk::Symbol::from_val(&env, &topics.get(1).unwrap())
-                == soroban_sdk::symbol_short!("remove")
-        {
-            let (emitted_addr,): (Address,) = soroban_sdk::FromVal::from_val(&env, &data);
-            assert!(emitted_addr == w1 || emitted_addr == w2);
-            removed += 1;
-        }
-    }
-    assert_eq!(removed, 2);
-
-    assert_eq!(client.get_watcher_count(), 0);
-    assert_eq!(client.get_watchers().len(), 0);
+    // A non-empty registry cannot be cleared below the `MIN_WATCHERS` floor:
+    // the call must fail outright so the caller learns the floor was hit.
+    assert_eq!(
+        client.try_clear_all_watchers(&admin).unwrap_err().unwrap(),
+        ContractError::BelowMinWatchers
+    );
+    assert_eq!(client.get_watcher_count(), 2);
+    assert_eq!(client.get_watchers().len(), 2);
+    assert!(client.is_watcher_authorized(&w1));
+    assert!(client.is_watcher_authorized(&w2));
 }
 
 /// Regression test for historical bug:
@@ -170,26 +171,40 @@ fn test_regression_remove_last_admin_lockout() {
 #[test]
 fn test_regression_pause_and_unpause_redundant_transitions_are_noops() {
     let (env, admin, client) = setup();
+    let admin_topic = soroban_sdk::symbol_short!("admin");
+    let pause = soroban_sdk::symbol_short!("pause");
+    let unpause = soroban_sdk::symbol_short!("unpause");
 
+    // Already unpaused (default): a redundant unpause is a no-op — no new
+    // unpause event is emitted.
+    let before = count_events(&env, &admin_topic, &unpause);
     client.unpause(&admin);
     assert!(!client.is_paused());
-    assert!(env.events().all().is_empty());
+    assert_eq!(count_events(&env, &admin_topic, &unpause), before);
 
+    // First pause transitions and emits exactly one pause event.
+    let before = count_events(&env, &admin_topic, &pause);
     client.pause(&admin);
     assert!(client.is_paused());
-    assert_eq!(env.events().all().len(), 1);
+    assert_eq!(count_events(&env, &admin_topic, &pause), before + 1);
 
+    // Already paused: a redundant pause is a no-op — no new pause event.
+    let before = count_events(&env, &admin_topic, &pause);
     client.pause(&admin);
     assert!(client.is_paused());
-    assert!(env.events().all().is_empty());
+    assert_eq!(count_events(&env, &admin_topic, &pause), before);
 
+    // First unpause transitions and emits exactly one unpause event.
+    let before = count_events(&env, &admin_topic, &unpause);
     client.unpause(&admin);
     assert!(!client.is_paused());
-    assert_eq!(env.events().all().len(), 1);
+    assert_eq!(count_events(&env, &admin_topic, &unpause), before + 1);
 
+    // Already unpaused: a redundant unpause is a no-op — no new unpause event.
+    let before = count_events(&env, &admin_topic, &unpause);
     client.unpause(&admin);
     assert!(!client.is_paused());
-    assert!(env.events().all().is_empty());
+    assert_eq!(count_events(&env, &admin_topic, &unpause), before);
 }
 
 /// Regression test for #370: an admin transfer proposal cannot be accepted
@@ -232,10 +247,21 @@ fn test_regression_propose_admin_transfer_rejects_sole_admin_as_new_admin() {
         ContractError::InvalidTransferRecipient,
         "Proposing the sole admin as new_admin must be rejected"
     );
-    // No pending transfer should have been created, and no event emitted.
-    assert!(env.events().all().is_empty());
+    // No pending transfer should have been created, and no ("admin","propose")
+    // event emitted by the rejected proposal.
     assert_eq!(
-        client.try_accept_admin_transfer(&admin).unwrap_err().unwrap(),
+        count_events(
+            &env,
+            &soroban_sdk::symbol_short!("admin"),
+            &soroban_sdk::symbol_short!("propose")
+        ),
+        0
+    );
+    assert_eq!(
+        client
+            .try_accept_admin_transfer(&admin)
+            .unwrap_err()
+            .unwrap(),
         ContractError::NoPendingTransfer
     );
 
@@ -345,6 +371,8 @@ fn test_are_watchers_authorized_batch_query() {
         client.are_watchers_authorized(&oversized).len() as u32,
         MAX_PAGE_SIZE
     );
+}
+
 /// Regression test for #403: `remove_admin` on an address that is not an
 /// admin must return `ContractError::AdminNotFound` and must not rewrite the
 /// admin set or emit an `admin.remove` event.
