@@ -994,6 +994,8 @@ impl WatcherRegistry {
     /// Returns [`ContractError::ScopeTooLong`] if `scope` exceeds [`MAX_SCOPE_LEN`].
     /// # Events
     /// Emits `("watcher", "scope")` with data `(watcher: Address, scope: Vec<Address>)`.
+    ///
+    /// See `docs/adr/0003-watcher-scopes.md` for how `AlertRegistry` enforces scopes.
     pub fn set_watcher_scope(
         env: Env,
         admin: Address,
