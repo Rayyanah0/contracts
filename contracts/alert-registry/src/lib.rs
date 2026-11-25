@@ -1842,6 +1842,11 @@ impl AlertRegistry {
 
         Self::persist_alert(&env, config_id, &config);
 
+        // Clean up stale WebhookProposalLedger (#568)
+        env.storage()
+            .persistent()
+            .remove(&DataKey::WebhookProposalLedger(config_id));
+
         env.events().publish(
             (symbol_short!("alert"), symbol_short!("webhook")),
             (config_id, caller),
@@ -1895,10 +1900,15 @@ impl AlertRegistry {
 
         // The live hash is deliberately left untouched until confirmation.
         config.pending_webhook_hash = Some(webhook_hash);
+        let proposal_key = DataKey::WebhookProposalLedger(config_id);
         env.storage().persistent().set(
-            &DataKey::WebhookProposalLedger(config_id),
+            &proposal_key,
             &env.ledger().sequence(),
         );
+        // Extend TTL to match proposal expiry window (#567)
+        env.storage()
+            .persistent()
+            .extend_ttl(&proposal_key, WEBHOOK_PROPOSAL_EXPIRY_LEDGERS, WEBHOOK_PROPOSAL_EXPIRY_LEDGERS);
 
         Self::persist_alert(&env, config_id, &config);
 
@@ -2016,6 +2026,11 @@ impl AlertRegistry {
         config.revision = config.revision.saturating_add(1);
 
         Self::persist_alert(&env, config_id, &config);
+
+        // Clean up stale WebhookProposalLedger (#568)
+        env.storage()
+            .persistent()
+            .remove(&DataKey::WebhookProposalLedger(config_id));
 
         env.events().publish(
             (symbol_short!("alert"), symbol_short!("wh_cancel")),
@@ -2837,11 +2852,23 @@ impl AlertRegistry {
         if tags.len() > MAX_TAGS_PER_ALERT {
             return Err(ContractError::TooManyTags);
         }
+        let mut seen = Vec::new(&env);
         for i in 0..tags.len() {
             let tag = tags.get(i).unwrap();
             if tag.is_empty() || tag.len() > MAX_TAG_LEN {
                 return Err(ContractError::InvalidTag);
             }
+            // Reject duplicates (#570)
+            if seen.contains(&tag) {
+                return Err(ContractError::InvalidTag);
+            }
+            // Reject control chars and restrict to printable ASCII (#570)
+            for c in tag.chars() {
+                if (c as u32) < 32 || (c as u32) == 127 || !c.is_ascii() {
+                    return Err(ContractError::InvalidTag);
+                }
+            }
+            seen.push_back(tag.clone());
         }
 
         let key = DataKey::AlertTags(config_id);
@@ -2911,9 +2938,13 @@ impl AlertRegistry {
             env.storage().persistent().remove(&key);
         } else {
             env.storage().persistent().set(&key, &until_ledger);
+            // Extend TTL to cover the entire snooze duration, not just DEFAULT_TTL (#569)
+            let current_ledger = env.ledger().sequence();
+            let snooze_duration = until_ledger.saturating_sub(current_ledger);
+            let ttl = snooze_duration.min((u32::MAX / 2).min(WEBHOOK_PROPOSAL_EXPIRY_LEDGERS * 2));
             env.storage()
                 .persistent()
-                .extend_ttl(&key, DEFAULT_TTL, DEFAULT_TTL);
+                .extend_ttl(&key, ttl, ttl);
         }
 
         env.events().publish(
