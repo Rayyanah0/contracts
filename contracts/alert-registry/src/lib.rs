@@ -459,6 +459,47 @@ pub struct AlertInput {
     pub rules: Vec<String>,
 }
 
+/// Comprehensive alert status snapshot including computed active state.
+///
+/// Returned by [`AlertRegistry::get_alert_status`] so dashboards can render
+/// one alert with one read instead of six separate calls.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct AlertStatus {
+    /// The base alert configuration.
+    pub config: AlertConfig,
+    /// Computed active state: `true` if the alert is active, suspended, snoozed, or expired.
+    /// This is the authoritative "is this alert currently active?" answer.
+    pub is_currently_active: bool,
+    /// Whether an admin has suspended this alert.
+    pub is_suspended: bool,
+    /// Ledger sequence until which the alert is snoozed, or `None` if not snoozed.
+    pub snoozed_until_ledger: Option<u32>,
+    /// Ledger sequence at which the alert expires, or `None` if not expiring.
+    pub expires_at_ledger: Option<u32>,
+    /// Pending alert ownership transfer awaiting recipient acceptance, if any.
+    pub pending_transfer: Option<PendingAlertTransfer>,
+    /// Ledger sequence at which the pending webhook proposal was made, or `None` if no proposal.
+    pub webhook_proposal_ledger: Option<u32>,
+}
+
+/// Alert configuration extended with sync-relevant state fields.
+///
+/// Used by sync getters to expose snooze, expiry and suspension state
+/// without changing the base AlertConfig structure.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct AlertConfigWithSyncState {
+    /// The base alert configuration.
+    pub config: AlertConfig,
+    /// Whether an admin has suspended this alert.
+    pub is_suspended: bool,
+    /// Ledger sequence until which the alert is snoozed, or `None` if not snoozed.
+    pub snoozed_until_ledger: Option<u32>,
+    /// Ledger sequence at which the alert expires, or `None` if not expiring.
+    pub expires_at_ledger: Option<u32>,
+}
+
 /// Current administrative configuration for the registry.
 ///
 /// Returned by [`AlertRegistry::get_configuration`] so dashboards can render
@@ -3270,6 +3311,17 @@ impl AlertRegistry {
     /// # Errors
     /// Returns [`ContractError::NotAWatcher`] if a watcher registry is configured
     /// and `querier` is not a registered watcher.
+    /// Get the computed active state of an alert, accounting for suspension, snooze and expiry.
+    ///
+    /// Returns `true` only if the alert's `active` flag is `true` AND it is not suspended
+    /// AND it is not snoozed (until_ledger > current_ledger) AND it is not expired
+    /// (expires_at_ledger <= current_ledger). This is the authoritative "is this alert
+    /// currently active?" answer.
+    ///
+    /// Returns `None` if the alert does not exist or has been removed.
+    ///
+    /// If a `WatcherRegistry` is configured, `querier` must be a registered
+    /// watcher or the call returns [`ContractError::NotAWatcher`].
     pub fn get_alert_active(
         env: Env,
         querier: Address,
@@ -3279,7 +3331,102 @@ impl AlertRegistry {
         Ok(env
             .storage()
             .persistent()
+            .get::<DataKey, AlertConfig>(&DataKey::Alert(config_id))
+            .map(|cfg| {
+                cfg.active
+                    && !Self::is_alert_suspended(&env, config_id)
+                    && !Self::is_snoozed(&env, config_id)
+                    && !Self::is_alert_expired(env.clone(), config_id)
+            }))
+    }
+
+    /// Get the raw active flag without computing suspension, snooze or expiry.
+    ///
+    /// **Deprecated:** Use [`AlertRegistry::get_alert_active`] instead, which returns
+    /// the computed active state accounting for suspension, snooze and expiry.
+    /// This function returns only the raw `active` flag stored on the alert.
+    #[deprecated(since = "0.3.0", note = "Use get_alert_active instead")]
+    pub fn get_alert_active_flag(
+        env: Env,
+        querier: Address,
+        config_id: u64,
+    ) -> Result<Option<bool>, ContractError> {
+        Self::assert_watcher_if_configured(&env, &querier)?;
+        Ok(env
+            .storage()
+            .persistent()
             .get(&DataKey::AlertActive(config_id)))
+    }
+
+    /// Get comprehensive status of an alert including computed active state and all state fields.
+    ///
+    /// This aggregates six separate queries into one call, reducing round trips for
+    /// dashboards that need: active flag, suspension state, snooze, expiry, pending
+    /// transfer, and pending webhook proposal.
+    ///
+    /// If a `WatcherRegistry` is configured, `querier` must be a registered
+    /// watcher or the call returns [`ContractError::NotAWatcher`].
+    ///
+    /// Returns `None` if the alert does not exist or has been removed.
+    pub fn get_alert_status(
+        env: Env,
+        querier: Address,
+        config_id: u64,
+    ) -> Result<Option<AlertStatus>, ContractError> {
+        Self::assert_watcher_if_configured(&env, &querier)?;
+        Ok(env
+            .storage()
+            .persistent()
+            .get::<DataKey, AlertConfig>(&DataKey::Alert(config_id))
+            .map(|config| {
+                let is_suspended = Self::is_alert_suspended(&env, config_id);
+                let is_snoozed = Self::is_snoozed(&env, config_id);
+                let is_expired = Self::is_alert_expired(env.clone(), config_id);
+                let is_currently_active = config.active && !is_suspended && !is_snoozed && !is_expired;
+
+                AlertStatus {
+                    config,
+                    is_currently_active,
+                    is_suspended,
+                    snoozed_until_ledger: env
+                        .storage()
+                        .persistent()
+                        .get(&DataKey::SnoozeUntil(config_id)),
+                    expires_at_ledger: env
+                        .storage()
+                        .persistent()
+                        .get(&DataKey::AlertExpiry(config_id)),
+                    pending_transfer: env
+                        .storage()
+                        .persistent()
+                        .get(&DataKey::PendingTransfer(config_id)),
+                    webhook_proposal_ledger: env
+                        .storage()
+                        .persistent()
+                        .get(&DataKey::WebhookProposalLedger(config_id)),
+                }
+            }))
+    }
+
+    /// Get the ledger sequence at which the pending webhook proposal was made.
+    ///
+    /// Returns `None` if no webhook rotation is currently in progress, or the
+    /// alert does not exist. Use this to determine whether a proposal is about
+    /// to expire and trigger a re-proposal: the proposal expires after
+    /// [`WEBHOOK_PROPOSAL_EXPIRY_LEDGERS`] ledgers.
+    ///
+    /// If a `WatcherRegistry` is configured, `querier` must be a registered
+    /// watcher or the call returns [`ContractError::NotAWatcher`].
+    pub fn get_webhook_proposal_ledger(
+        env: Env,
+        querier: Address,
+        config_id: u64,
+    ) -> Result<Option<u32>, ContractError> {
+        Self::assert_watcher_if_configured(&env, &querier)?;
+        Ok(env
+            .storage()
+            .persistent()
+            .get(&DataKey::WebhookProposalLedger(config_id)))
     }
 
     /// Read the owner of an alert without returning the full config.
@@ -3610,6 +3757,59 @@ impl AlertRegistry {
         limit: u32,
     ) -> Vec<AlertConfig> {
         Self::scan_alerts_modified(&env, offset, limit, |cfg| cfg.updated_ledger >= since_ledger)
+    }
+
+    /// Get alerts modified since a ledger, including snooze/expiry/suspension state.
+    ///
+    /// Like [`AlertRegistry::get_alerts_modified_since_ledger`], but also includes
+    /// whether each alert is suspended, its snooze deadline, and its expiry deadline.
+    /// This avoids three extra calls per alert for watchers deciding whether to fire.
+    pub fn get_alerts_modified_since_ledger_with_sync_state(
+        env: Env,
+        since_ledger: u32,
+        offset: u32,
+        limit: u32,
+    ) -> Vec<AlertConfigWithSyncState> {
+        let total: u64 = env
+            .storage()
+            .instance()
+            .get(&instance_key::NEXT_ID)
+            .unwrap_or(0u64);
+
+        let range_start = u64::from(offset).min(total);
+        let range_end = u64::from(offset)
+            .saturating_add(u64::from(limit.min(MAX_PAGE_SIZE)))
+            .min(total);
+
+        let mut out: Vec<AlertConfigWithSyncState> = vec![&env];
+        for id in range_start..range_end {
+            if let Some(config) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, AlertConfig>(&DataKey::Alert(id))
+                .or_else(|| {
+                    env.storage()
+                        .persistent()
+                        .get::<DataKey, AlertConfig>(&DataKey::RemovedAlert(id))
+                })
+            {
+                if config.updated_ledger >= since_ledger {
+                    out.push_back(AlertConfigWithSyncState {
+                        config,
+                        is_suspended: Self::is_alert_suspended(&env, id),
+                        snoozed_until_ledger: env
+                            .storage()
+                            .persistent()
+                            .get(&DataKey::SnoozeUntil(id)),
+                        expires_at_ledger: env
+                            .storage()
+                            .persistent()
+                            .get(&DataKey::AlertExpiry(id)),
+                    });
+                }
+            }
+        }
+        out
     }
 
     /// Return the oldest ledger sequence from which incremental sync is
@@ -4467,7 +4667,11 @@ impl AlertRegistry {
                 .persistent()
                 .get::<DataKey, AlertConfig>(&DataKey::Alert(id))
             {
-                if cfg.active && !Self::is_snoozed(env, id) {
+                if cfg.active
+                    && !Self::is_snoozed(env, id)
+                    && !Self::is_alert_expired(env.clone(), id)
+                    && !Self::is_alert_suspended(env, id)
+                {
                     out.push_back(cfg);
                 }
             }
