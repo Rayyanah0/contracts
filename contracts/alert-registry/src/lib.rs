@@ -3275,6 +3275,15 @@ impl AlertRegistry {
     ///
     /// See `docs/adr/0002-alert-activity-model.md` for how "active" combines the owner flag, admin suspension, snooze and expiry.
     pub fn get_active_contract_alerts_paginated(
+        env: Env,
+        querier: Address,
+        target_contract: Address,
+        offset: u32,
+        limit: u32,
+    ) -> Result<Vec<AlertConfig>, ContractError> {
+        Self::get_active_contract_alerts_paged(env, querier, target_contract, offset, limit)
+    }
+
     /// Get a page of **active** alert configs for a target contract.
     ///
     /// The bounded, paginated replacement for
@@ -3761,41 +3770,6 @@ impl AlertRegistry {
     /// advancing `offset` by `limit` until it reaches `get_alert_count()`;
     /// a short or empty result page does not indicate that the scan is complete.
     #[must_use]
-    pub fn get_alerts_modified_since(
-        env: Env,
-        since: u64,
-        offset: u32,
-        limit: u32,
-    ) -> Vec<AlertConfig> {
-        let total: u64 = env
-            .storage()
-            .instance()
-            .get(&instance_key::NEXT_ID)
-            .unwrap_or(0u64);
-
-        let range_start = u64::from(offset).min(total);
-        let range_end = u64::from(offset)
-            .saturating_add(u64::from(limit.min(MAX_PAGE_SIZE)))
-            .min(total);
-
-        let mut out: Vec<AlertConfig> = vec![&env];
-        for id in range_start..range_end {
-            if let Some(cfg) = env
-                .storage()
-                .persistent()
-                .get::<DataKey, AlertConfig>(&DataKey::Alert(id))
-                .or_else(|| {
-                    env.storage()
-                        .persistent()
-                        .get::<DataKey, AlertConfig>(&DataKey::RemovedAlert(id))
-                })
-            {
-                if cfg.updated_at >= since {
-                    out.push_back(cfg);
-                }
-            }
-        }
-        out
     pub fn get_alerts_modified_since(env: Env, since: u64, offset: u32, limit: u32) -> Vec<AlertConfig> {
         Self::scan_alerts_modified(&env, offset, limit, |cfg| cfg.updated_at >= since)
     }
@@ -3933,6 +3907,16 @@ impl AlertRegistry {
 
     /// Get the number of currently active alerts owned by `owner`.
     ///
+    /// Unlike [`AlertRegistry::get_alert_count`], this reflects removals and only
+    /// counts alerts with `active == true`; deactivated-but-not-removed alerts
+    /// are excluded. Reads are **O(1)**: it returns the running
+    /// [`DataKey::OwnerActiveCount`] counter, which every mutator that flips the
+    /// `active` flag, moves an alert between owners, or removes it keeps in
+    /// step (#385), and never rescans the owner's index. On a counter miss (an
+    /// alert registered before the counter existed) the value is rebuilt once
+    /// from the index and then maintained incrementally. For the live count
+    /// regardless of the `active` flag, use
+    /// [`AlertRegistry::get_non_removed_alert_count`].
     /// Unlike [`AlertRegistry::get_alert_count`], this reflects removals and only counts
     /// alerts with `active == true` — deactivated-but-not-removed alerts are
     /// excluded, so the result matches the `active` flag of the alerts
@@ -4002,19 +3986,6 @@ impl AlertRegistry {
     /// See `docs/adr/0002-alert-activity-model.md` for how "active" combines the owner flag, admin suspension, snooze and expiry.
     pub fn get_active_contract_alert_count(env: Env, target_contract: Address) -> u32 {
         Self::contract_live_count(&env, &target_contract)
-        let ids = Self::contract_index(&env, &target_contract);
-        let mut count: u32 = 0;
-        for id in ids.iter() {
-            if env
-                .storage()
-                .persistent()
-                .get::<DataKey, bool>(&DataKey::AlertActive(id))
-                == Some(true)
-            {
-                count += 1;
-            }
-        }
-        count
     }
 
     // ── Internal helpers ─────────────────────────────────────────────────────
