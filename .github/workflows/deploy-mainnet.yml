@@ -24,7 +24,7 @@ jobs:
       pull-requests: write
 
     steps:
-      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.inputs.release_tag }}
 
@@ -111,7 +111,6 @@ jobs:
             --alert-hash "${{ steps.deploy.outputs.alert_hash }}" \
             --watcher-hash "${{ steps.deploy.outputs.watcher_hash }}" \
             --tag "$RELEASE_TAG" \
-            --tag "${{ github.event.inputs.release_tag }}" \
             --notes "Production mainnet release"
 
       # Issue #290 — Include WASM hashes in PR body
