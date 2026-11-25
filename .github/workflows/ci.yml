@@ -199,6 +199,9 @@ jobs:
         run: bash scripts/check-events-doc.sh
       - name: Check storage documentation
         run: python3 scripts/check_storage_doc.py
+      # Merge-splice leftovers: duplicated doc paragraphs, repeated # Events/# Errors, stacked #[deprecated]
+      - name: Check doc comments for merge leftovers
+        run: python3 scripts/check_doc_comments.py
 
   # Issue #103, #282 — Code coverage reporting on pinned toolchain with llvm-tools-preview
   coverage:
