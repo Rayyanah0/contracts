@@ -17,10 +17,16 @@ env.storage().persistent().extend_ttl(&key, DEFAULT_TTL, DEFAULT_TTL);
 This applies to:
 - `DataKey::Alert(id)` — individual alert configs
 - `DataKey::AlertActive(id)` — per-alert active flag
+- `DataKey::AlertExpiry(id)` — per-alert expiry timestamp
+- `DataKey::AlertTags(id)` — per-alert tag list
+- `DataKey::SnoozeUntil(id)` — per-alert snooze deadline
+- `DataKey::AlertTarget(id)` — per-alert target contract
+- `DataKey::WebhookProposalLedger(id)` — ledger at which the pending webhook proposal was made
 - `DataKey::AdminSuspended(id)` — present while an admin has suspended the alert
 - `DataKey::RemovedAlert(id)` — removal tombstone (see [Other Persistent Entries](#other-persistent-entries))
 - `DataKey::OwnerIndex(address)` — per-owner alert ID lists
 - `DataKey::OwnerLiveCount(address)` — per-owner live alert count
+- `DataKey::OwnerActiveCount(address)` — per-owner active alert count
 - `DataKey::ContractIndex(address)` — per-contract alert ID lists
 - `DataKey::ContractLiveCount(address)` — per-contract live alert count
 - `DataKey::DeactivationCursor(address)` — resume point for a bulk deactivation
@@ -30,10 +36,14 @@ The exception is `DataKey::PendingTransfer(id)`, which uses
 `ALERT_TRANSFER_EXPIRY_LEDGERS` (see [Non-Default TTLs](#non-default-ttls)).
 For each key's tier and value type, see [docs/storage.md](storage.md).
 
+The `watcher-registry` keeps its admins, watchers and timelock in **instance
 The `watcher-registry` keeps its admin, watcher list and timelock in **instance
 storage**, which has its own TTL managed by the network. No registry entrypoint
 extends it as a side effect, so see
 [Keeping the watcher registry alive](#keeping-the-watcher-registry-alive) below.
+Its per-watcher metadata (registration ledger, label and similar bookkeeping)
+lives in persistent entries written with `DEFAULT_TTL` and refreshed by the
+registry's own mutators.
 
 It also has **two persistent keys**, both written with `DEFAULT_TTL` and
 extended on every read and write:
@@ -61,9 +71,10 @@ Only these paths write a TTL other than `DEFAULT_TTL`:
 | Entry | TTL (ledgers) | Wall-clock | Set by |
 |-------|---------------|------------|--------|
 | `PendingTransfer(id)` | `ALERT_TRANSFER_EXPIRY_LEDGERS` = 120 960 | ~7 days | `propose_alert_transfer` |
-| `Alert`, `AlertActive`, `OwnerIndex`, `ContractIndex` (and the other alert-dependent entries) | Requested, capped at `MAX_TTL` = 535 680 (at least `DEFAULT_TTL`; smaller values are rejected with `InvalidTtl`) | up to ~31 days | `bump_alert` (anyone) |
+| `Alert`, `AlertActive`, `AlertExpiry`, `AlertTags`, `SnoozeUntil`, `AlertTarget`, `OwnerIndex`, `OwnerActiveCount`, `ContractIndex` (and the other alert-dependent entries) | Requested, capped at `MAX_TTL` = 535 680 (at least `DEFAULT_TTL`; smaller values are rejected with `InvalidTtl`) | up to ~31 days | `bump_alert` (anyone) |
 | The same alert-dependent entries | Requested, between `DEFAULT_TTL` and `MAX_TTL` | up to ~31 days | `renew_alert_ttl_for` (owner only) |
 | The same alert-dependent entries | at least `ALERT_TRANSFER_EXPIRY_LEDGERS` = 120 960 | ~7 days | `propose_alert_transfer`, so the alert cannot expire while the transfer is open |
+| `WebhookProposalLedger(id)` | `DEFAULT_TTL` = 17 280, refreshed by `propose_webhook` | ~24 hours | `propose_webhook` |
 | Instance entry (both registries) | `INSTANCE_BUMP_AMOUNT` = 535 680 | ~31 days | `bump_instance_ttl` |
 
 `PendingTransfer` is written only by `propose_alert_transfer` and is not
@@ -89,11 +100,18 @@ removed when the sweep finishes or the owner's index changes. If it expires,
 the next call restarts from the beginning, which is harmless because alerts
 already deactivated are skipped.
 
-**Live counters.** `ContractLiveCount` and `OwnerLiveCount` are written with
-`DEFAULT_TTL` and extended by `touch_alert` whenever they are present.
-If `ContractLiveCount` expires, `contract_live_count` rebuilds it from
-`ContractIndex` on the next read. `OwnerLiveCount` has no such rebuild: if it
-expires, `owner_live_count` reads it as `0` until the next write.
+**Live counters.** `ContractLiveCount`, `OwnerLiveCount` and `OwnerActiveCount`
+are written with `DEFAULT_TTL` and extended by `touch_alert` whenever they are
+present. If `ContractLiveCount` expires, `contract_live_count` rebuilds it from
+`ContractIndex` on the next read. `OwnerLiveCount` and `OwnerActiveCount` have
+no such rebuild: if they expire, the corresponding getter reads them as `0`
+until the next write.
+
+**Per-alert metadata.** `AlertExpiry`, `AlertTags`, `SnoozeUntil` and
+`AlertTarget` are written alongside the alert with `DEFAULT_TTL` and extended by
+`touch_alert` whenever they are present, so they follow the alert's TTL.
+`WebhookProposalLedger` is written by `propose_webhook` with `DEFAULT_TTL` and
+is removed when the proposal is confirmed or cancelled.
 
 **Admin suspension.** `AdminSuspended(id)` is written with the alert and
 extended by `touch_alert` whenever it is present, so it follows the alert's
@@ -200,12 +218,14 @@ the alert's content.
 
 Every mutating call refreshes the **whole set** of entries an alert depends on
 through a single internal helper, `touch_alert`:
-`Alert(id)`, `AlertActive(id)`, `OwnerIndex(owner)`, `OwnerLiveCount(owner)`, `ContractIndex(target)`,
+`Alert(id)`, `AlertActive(id)`, `AlertExpiry(id)`, `AlertTags(id)`,
+`SnoozeUntil(id)`, `AlertTarget(id)`, `OwnerIndex(owner)`, `OwnerLiveCount(owner)`,
+`OwnerActiveCount(owner)`, `ContractIndex(target)`,
 plus `ContractLiveCount(target)` and `AdminSuspended(id)` when they are present.
 Mutators that rewrite the alert call `persist_alert`, which writes the config
 and its `AlertActive` flag and then calls `touch_alert` with `DEFAULT_TTL`, so
-no mutator can extend one entry and forget another. (`OwnerLiveCount` is only
-extended when present; see `docs/storage.md`.)
+no mutator can extend one entry and forget another. (`OwnerLiveCount` and
+`OwnerActiveCount` are only extended when present; see `docs/storage.md`.)
 
 | Function              | Entries extended |
 |-----------------------|-----------------|
@@ -222,6 +242,7 @@ extended when present; see `docs/storage.md`.)
 | `update_target_contract` | Full set with the **new** target's `ContractIndex`, to `DEFAULT_TTL`; the old target's index is rewritten and extended |
 | `deactivate_all_alerts` | Full set for each deactivated alert, to `DEFAULT_TTL`; `DeactivationCursor(owner)` to `DEFAULT_TTL` while a sweep is unfinished |
 | `renew_alert_ttl`     | Full set, to `DEFAULT_TTL` — data unchanged |
+| `renew_alert_ttl_for` | Full set, to the requested TTL (between `DEFAULT_TTL` and `MAX_TTL`) — data unchanged |
 | `bump_alert`          | Full set, to the requested TTL (capped at `MAX_TTL`) — data unchanged |
 | `remove_alert`        | `Alert(id)` and `AlertActive(id)` are deleted; `RemovedAlert(id)` tombstone written to `DEFAULT_TTL` and not extended again; owner/contract indexes and both live counts are rewritten and extended |
 | `remove_alert_by_admin` | Same as `remove_alert` |
@@ -232,7 +253,7 @@ Read-only functions (`get_alert`, `get_alerts_for_contract`, `get_alerts_by_owne
 ## Implications
 
 - **Inactive alerts expire eventually.** An alert that is registered but never updated will be archived after `DEFAULT_TTL` (17,280 ledgers, ~24 hours).
-- **Watchers must keep alerts alive.** Any off-chain service relying on alert data should periodically call `update_alert` (or a dedicated bump function) to prevent expiry.
+- **Watchers must keep alerts alive.** Any off-chain service relying on alert data should periodically call `bump_alert` (permissionless — any address may call it) or `renew_alert_ttl_for` (owner only) to prevent expiry. Do **not** use `update_alert` as a keep-alive: it rewrites the alert's content and bumps its revision, which is visible to sync clients and watchers.
 - **Archived entries are not deleted.** They can be restored via `RestoreFootprintOp`, but this requires paying a fee and is not currently automated.
 
 ## Recommendations

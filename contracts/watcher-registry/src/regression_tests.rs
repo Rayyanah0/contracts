@@ -810,6 +810,72 @@ fn test_regression_pending_action_cancelled_on_proposer_removal() {
     assert!(!client.is_admin(&third_admin));
 }
 
+/// Regression test for #590: `get_pending_admin_transfer` must decode the
+/// stored `(proposer, new_admin, expires_at_ledger)` tuple and return the
+/// proposed `new_admin`, rather than misreading it as `(Address, u32)`.
+#[test]
+fn test_regression_get_pending_admin_transfer_returns_new_admin() {
+    let (env, admin, client) = setup();
+    let new_admin = Address::generate(&env);
+
+    // No proposal yet.
+    assert!(client.get_pending_admin_transfer().is_none());
+
+    client.propose_admin_transfer(&admin, &new_admin);
+    assert_eq!(
+        client.get_pending_admin_transfer(),
+        Some(new_admin.clone()),
+        "Getter must return the proposed new_admin while a transfer is pending"
+    );
+
+    // After accepting, there is no pending transfer.
+    client.accept_admin_transfer(&new_admin);
+    assert!(client.is_admin(&new_admin));
+    assert!(client.get_pending_admin_transfer().is_none());
+}
+
+/// Regression test for #590: an expired proposal must not be reported by
+/// `get_pending_admin_transfer` (matching AlertRegistry), and accepting it
+/// must still fail with `AdminTransferExpired`.
+#[test]
+fn test_regression_get_pending_admin_transfer_none_when_expired() {
+    use soroban_sdk::testutils::Ledger as _;
+
+    let (env, admin, client) = setup();
+    let new_admin = Address::generate(&env);
+    client.propose_admin_transfer(&admin, &new_admin);
+    assert_eq!(client.get_pending_admin_transfer(), Some(new_admin.clone()));
+
+    // One ledger past the expiry ledger.
+    env.ledger()
+        .with_mut(|li| li.sequence_number += ADMIN_TRANSFER_EXPIRY_LEDGERS + 1);
+
+    assert!(
+        client.get_pending_admin_transfer().is_none(),
+        "Expired proposals must not be returned by the getter"
+    );
+    assert_eq!(
+        client
+            .try_accept_admin_transfer(&new_admin)
+            .unwrap_err()
+            .unwrap(),
+        ContractError::AdminTransferExpired
+    );
+}
+
+/// Regression test for #590: cancelling a pending transfer clears it, so the
+/// getter returns `None` afterwards.
+#[test]
+fn test_regression_get_pending_admin_transfer_none_after_cancel() {
+    let (env, admin, client) = setup();
+    let new_admin = Address::generate(&env);
+
+    client.propose_admin_transfer(&admin, &new_admin);
+    assert_eq!(client.get_pending_admin_transfer(), Some(new_admin.clone()));
+
+    client.cancel_admin_transfer(&admin);
+    assert!(client.get_pending_admin_transfer().is_none());
+    assert!(!client.is_admin(&new_admin));
 /// Regression test for #597: while the registry is paused, a pending admin
 /// transfer cannot be accepted, but it can still be cancelled.
 #[test]
