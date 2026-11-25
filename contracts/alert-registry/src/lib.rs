@@ -2763,7 +2763,7 @@ impl AlertRegistry {
     /// Returns [`ContractError::Paused`] while the contract is paused.
     ///
     /// # Events
-    /// Emits `(Symbol("alert"), Symbol("remove_all"))` with data
+    /// Emits `(Symbol("alert"), Symbol("rm_all"))` with data
     /// `(caller: Address, count: u32)` when at least one entry was processed.
     pub fn remove_all_alerts(env: Env, caller: Address) -> Result<u32, ContractError> {
         caller.require_auth();

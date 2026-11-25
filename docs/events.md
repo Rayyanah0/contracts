@@ -186,6 +186,27 @@ Emitted when an alert is removed by its owner or by an admin.
 
 ---
 
+### `alert.rm_all`
+
+Emitted by `remove_all_alerts` when at least one index entry is processed in
+the pass. Each call removes up to a bounded number of the caller's alerts, so
+a caller with more alerts needs repeated calls. The event is emitted once per
+call, not once per removed alert.
+
+| Field | Value |
+|---|---|
+| Topic 0 | `Symbol("alert")` |
+| Topic 1 | `Symbol("rm_all")` |
+| Data | `(caller: Address, count: u32)` |
+
+> `count` is the number of entries processed in this pass, including dangling
+> IDs whose records had already expired. It is not necessarily the number of
+> alerts that were removed.
+
+**Status:** ✅ implemented (`remove_all_alerts`)
+
+---
+
 ### `alert.bump`
 
 Emitted when an alert's TTL is extended via `bump_alert`.
