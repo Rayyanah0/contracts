@@ -857,12 +857,6 @@ impl AlertRegistry {
             .instance()
             .get(&instance_key::ADMIN)
             .ok_or(ContractError::NotInitialized)?;
-
-        let old_admin: Address = env
-            .storage()
-            .instance()
-            .get(&instance_key::ADMIN)
-            .ok_or(ContractError::NotInitialized)?;
         env.storage()
             .instance()
             .set(&instance_key::ADMIN, &new_admin);
@@ -908,8 +902,6 @@ impl AlertRegistry {
             .remove(&DataKey::PendingAdminTransfer);
         Self::extend_instance_ttl(&env);
 
-        env.events()
-            .publish((symbol_short!("admin"), symbol_short!("cancel")), admin);
         env.events().publish(
             (symbol_short!("admin"), symbol_short!("cancel")),
             (admin,),
@@ -941,7 +933,6 @@ impl AlertRegistry {
         admin.require_auth();
         Self::assert_admin(&env, &admin)?;
 
-        env.deployer().update_current_contract_wasm(new_wasm_hash.clone());
         env.deployer()
             .update_current_contract_wasm(new_wasm_hash.clone());
         env.events().publish(
@@ -1733,6 +1724,9 @@ impl AlertRegistry {
     ///
     /// # Events
     /// Emits `(Symbol("alert"), Symbol("act_set"))` with data
+    /// `(id: u64, owner: Address, active: bool)`. Off-chain indexers can use
+    /// this topic to detect activation toggles without re-fetching the alert.
+    /// This topic is distinct from
     /// `(id: u64, owner: Address, active: bool)`. This topic is distinct from
     /// the `update` topic [`AlertRegistry::update_alert`] emits, so an indexer
     /// can tell a pure activation toggle from a rules rewrite.
@@ -1805,7 +1799,6 @@ impl AlertRegistry {
         // tell an activation toggle (rules unchanged) from a rules rewrite
         // without re-fetching the alert (#382).
         env.events().publish(
-            (symbol_short!("alert"), symbol_short!("active")),
             (symbol_short!("alert"), symbol_short!("act_set")),
             (config_id, config.owner, active),
         );
@@ -3200,17 +3193,6 @@ impl AlertRegistry {
     /// Dangling IDs (alerts whose storage entry has expired or been removed)
     /// are filtered out, so every returned ID corresponds to a live alert.
     ///
-    /// Returns an empty vec if `owner` has no registered alerts.
-    #[must_use]
-    pub fn get_alert_ids_by_owner(env: Env, owner: Address) -> Vec<u64> {
-        let ids = Self::owner_index(&env, &owner);
-        ids.into_iter()
-            .filter(|id| {
-                env.storage()
-                    .persistent()
-                    .has(&DataKey::Alert(*id))
-            })
-            .collect()
     /// Returns an empty vec if `owner` has no live registered alerts.
     #[must_use]
     pub fn get_alert_ids_by_owner(env: Env, owner: Address) -> Vec<u64> {
