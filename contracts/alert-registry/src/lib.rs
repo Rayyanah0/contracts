@@ -4402,6 +4402,17 @@ impl AlertRegistry {
         if storage.has(&suspended_key) {
             storage.extend_ttl(&suspended_key, ttl, ttl);
         }
+        // Side keys must outlive the alert, or tags/snooze/expiry and a staged
+        // webhook proposal silently vanish before the alert does.
+        for side_key in [
+            DataKey::AlertTags(config_id),
+            DataKey::SnoozeUntil(config_id),
+            DataKey::AlertExpiry(config_id),
+            DataKey::WebhookProposalLedger(config_id),
+        ] {
+            if storage.has(&side_key) {
+                storage.extend_ttl(&side_key, ttl, ttl);
+            }
         let expiry_key = DataKey::AlertExpiry(config_id);
         if storage.has(&expiry_key) {
             storage.extend_ttl(&expiry_key, ttl, ttl);
