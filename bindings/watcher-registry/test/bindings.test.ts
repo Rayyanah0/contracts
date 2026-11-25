@@ -59,6 +59,8 @@ describe("WatcherRegistry bindings", () => {
     expect(typeof client.is_paused).toBe("function");
     expect(typeof client.get_watcher_count).toBe("function");
     expect(typeof client.get_timelock_delay).toBe("function");
+    expect(typeof client.get_guardian).toBe("function");
+    expect(typeof client.get_configuration).toBe("function");
   });
 
   it("are_watchers_authorized rejects oversized batches instead of truncating", async () => {
@@ -93,7 +95,24 @@ describe("WatcherRegistry bindings", () => {
     expect(typeof client.unpause).toBe("function");
     expect(typeof client.bump_instance_ttl).toBe("function");
     expect(typeof client.set_timelock_delay).toBe("function");
+    expect(typeof client.set_guardian).toBe("function");
     expect(typeof client.propose_admin_transfer).toBe("function");
     expect(typeof client.accept_admin_transfer).toBe("function");
+  });
+
+  it("exposes the timelocked admin action proposal path", () => {
+    const client = new Client(testnetConfig);
+    // Lowering or disabling the timelock delay must go through the
+    // timelocked proposal path rather than the raise-only direct setter.
+    expect(typeof client.propose_admin_action).toBe("function");
+    expect(typeof client.execute_admin_action).toBe("function");
+    expect(typeof client.get_pending_admin_action).toBe("function");
+  });
+
+  it("does not expose a dead clear_all_watchers entrypoint", () => {
+    const client = new Client(testnetConfig);
+    // clear_all_watchers could only ever succeed on an empty registry, so it
+    // was removed in favour of explicit remove_watcher calls.
+    expect(client.clear_all_watchers).toBeUndefined();
   });
 });

@@ -14,6 +14,15 @@
  *
  *   import { Client, networks } from "@tx-wats/watcher-registry-bindings";
  *
+ * Governance surface notes (keep in sync with the contract):
+ *   - `setGuardian` / `getGuardian`: a low-privilege guardian may `pause`
+ *     the registry but may not `unpause` it (admin-only).
+ *   - `proposeAdminAction` accepts `SetTimelockDelay` values both above and
+ *     below the current delay; the timelock protects the change. The direct
+ *     `setTimelockDelay` remains raise-only.
+ *   - `clearAllWatchers` has been removed; use `removeWatchers` (or the
+ *     timelocked `ClearAllWatchers` action, which now takes a kept set).
+ *
  * @see https://github.com/Tx-wat/stellar-txwatch-contracts
  */
 
@@ -31,6 +40,88 @@
 // failure. The generated `Client` surfaces this as a thrown error carrying the
 // contract error code; the corresponding error type is re-exported below.
 export * from "./watcher_registry.js";
+
+// ── Governance helpers ────────────────────────────────────────────────────────
+// Thin, hand-maintained wrappers over the generated client so consumers get a
+// stable, documented surface for the guardian role and the timelock-delay
+// proposal semantics. These delegate to the generated `Client` methods.
+
+import type { Client } from "./watcher_registry.js";
+
+/** Minimal structural type for the generated client's governance methods. */
+export interface GovernanceClient {
+  setGuardian(args: { guardian: string | null }): Promise<unknown>;
+  getGuardian(): Promise<string | null>;
+  pause(args: { caller: string }): Promise<unknown>;
+  unpause(args: { caller: string }): Promise<unknown>;
+  proposeAdminAction(args: {
+    proposer: string;
+    action: unknown;
+  }): Promise<unknown>;
+  setTimelockDelay(args: { caller: string; delay: bigint }): Promise<unknown>;
+}
+
+/**
+ * Set (or clear, with `null`) the guardian address. Admin-only.
+ * Mirrors `set_guardian` in the contract.
+ */
+export function setGuardian(
+  client: Client,
+  guardian: string | null,
+): Promise<unknown> {
+  return (client as unknown as GovernanceClient).setGuardian({ guardian });
+}
+
+/** Read the current guardian address, if any. Mirrors `get_guardian`. */
+export function getGuardian(client: Client): Promise<string | null> {
+  return (client as unknown as GovernanceClient).getGuardian();
+}
+
+/**
+ * Pause the registry. Callable by the admin or the guardian.
+ * Mirrors the guardian-aware `pause` entrypoint.
+ */
+export function pause(client: Client, caller: string): Promise<unknown> {
+  return (client as unknown as GovernanceClient).pause({ caller });
+}
+
+/**
+ * Unpause the registry. Admin-only — the guardian cannot unpause.
+ */
+export function unpause(client: Client, caller: string): Promise<unknown> {
+  return (client as unknown as GovernanceClient).unpause({ caller });
+}
+
+/**
+ * Propose a timelocked admin action. `SetTimelockDelay` may raise *or* lower
+ * the delay; the timelock protects the change. The direct `setTimelockDelay`
+ * below remains raise-only.
+ */
+export function proposeAdminAction(
+  client: Client,
+  proposer: string,
+  action: unknown,
+): Promise<unknown> {
+  return (client as unknown as GovernanceClient).proposeAdminAction({
+    proposer,
+    action,
+  });
+}
+
+/**
+ * Directly set the timelock delay. Raise-only: lowering the delay must go
+ * through `proposeAdminAction` with a `SetTimelockDelay` action.
+ */
+export function setTimelockDelay(
+  client: Client,
+  caller: string,
+  delay: bigint,
+): Promise<unknown> {
+  return (client as unknown as GovernanceClient).setTimelockDelay({
+    caller,
+    delay,
+  });
+}
 
 // ── Network address map ───────────────────────────────────────────────────────
 // Keyed by Stellar network name. DEPLOYMENTS.md is the source of truth: update
@@ -53,6 +144,31 @@ export interface NetworkConfig {
 }
 
 export type NetworkName = "testnet" | "mainnet";
+
+// ── Configuration snapshot ────────────────────────────────────────────────────
+// Mirrors the on-chain `WatcherRegistryConfiguration` struct returned by
+// `get_configuration()`. Dashboards can fetch the full registry state in a
+// single call instead of invoking `get_admins`, `is_paused`,
+// `get_timelock_delay`, `get_pending_action`, `get_pending_admin_transfer`
+// and `get_watcher_count` separately.
+//
+// The generated `Client` exposes `get_configuration()` which resolves to this
+// shape (the generated XDR type is structurally compatible).
+
+export interface WatcherRegistryConfiguration {
+  /** Current admin addresses. */
+  admins: string[];
+  /** Whether the registry is paused. */
+  paused: boolean;
+  /** Timelock delay (in ledgers) applied to admin actions. */
+  timelockDelay: bigint;
+  /** Currently pending timelocked action, if any. */
+  pendingAction: unknown | null;
+  /** Currently pending admin transfer, if any. */
+  pendingAdminTransfer: unknown | null;
+  /** Number of registered watchers. */
+  watcherCount: number;
+}
 
 export const networks = {
   testnet: {
