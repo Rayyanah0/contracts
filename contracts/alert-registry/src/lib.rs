@@ -138,12 +138,6 @@ pub enum DataKey {
     /// number. Formerly `OwnerActiveCount`; entries written under that key are
     /// migrated on first read (see `AlertRegistry::owner_live_count`).
     OwnerLiveCount(Address),
-    /// Stores the number of currently **active** (non-removed, unexpired) alerts
-    /// owned by a given address, maintained incrementally alongside
-    /// [`DataKey::OwnerIndex`] so [`AlertRegistry::get_active_alert_count`] never
-    /// has to rescan the owner's full index.
-    ///
-    /// "Active" means non-removed AND active=true (not deactivated by owner or admin).
     /// Stores the number of currently **active** (`active == true`) alerts owned
     /// by a given address, maintained incrementally by every mutator that flips
     /// the `active` flag, moves an alert between owners, or removes it.
@@ -232,7 +226,6 @@ pub mod instance_key {
     pub const LIMIT: Symbol = symbol_short!("LIMIT");
     /// `u32` per-contract alert limit (`0` = unlimited).
     pub const CLIMIT: Symbol = symbol_short!("CLIMIT");
-    /// `u32` ceiling on the total number of live alerts (`0` = none).
     /// `u32` ceiling on the number of **live** alerts (`0` = none).
     ///
     /// Counts live (non-removed) records, not the number ever registered: see
@@ -242,8 +235,6 @@ pub mod instance_key {
     pub const LIVE: Symbol = symbol_short!("LIVE");
     /// `Address` of the optional `WatcherRegistry` used for read gating.
     pub const WATCHREG: Symbol = symbol_short!("WATCHREG");
-    /// `Address` of the optional guardian, allowed to `pause` but never
-    /// `unpause` (see [`crate::AlertRegistry::set_guardian`]).
     /// `Address` of the optional guardian — a limited role that may call
     /// `pause` but never `unpause` or any other admin function. See
     /// [`crate::AlertRegistry::set_guardian`].
@@ -518,7 +509,6 @@ pub struct RegistryConfiguration {
     pub per_owner_alert_limit: u32,
     /// Maximum live alerts per target contract, or `0` for unlimited.
     pub per_contract_alert_limit: u32,
-    /// Maximum live alerts, or `0` for unlimited.
     /// Maximum live (non-removed) alerts registry-wide, or `0` for unlimited.
     pub global_alert_limit: u32,
     /// Configured watcher registry, if watcher-gating is enabled.
@@ -836,7 +826,6 @@ impl AlertRegistry {
     ///
     /// # Events
     /// Emits `(Symbol("admin"), Symbol("transfer"))` with data
-    /// `(old_admin: Address, new_admin: Address)`.
     /// `(old_admin: Address, new_admin: Address)`, the same shape as `transfer_admin`.
     pub fn accept_admin_transfer(env: Env, new_admin: Address) -> Result<(), ContractError> {
         new_admin.require_auth();
@@ -1241,8 +1230,6 @@ impl AlertRegistry {
             .unwrap_or(0u32)
     }
 
-    /// Set a global ceiling on the total number of live alerts
-    /// (admin only). A value of `0` means no limit.
     /// Set a global ceiling on the number of **live** alerts (admin only).
     /// A value of `0` means no limit.
     ///
@@ -1737,9 +1724,6 @@ impl AlertRegistry {
     /// so a client cannot accidentally clear its rules with an empty vector.
     ///
     /// # Events
-    /// Emits `(Symbol("alert"), Symbol("active"))` with data
-    /// `(id: u64, owner: Address, active: bool)`. Off-chain indexers can use
-    /// this topic to detect activation toggles without re-fetching the alert.
     /// Emits `(Symbol("alert"), Symbol("act_set"))` with data
     /// `(id: u64, owner: Address, active: bool)`. This topic is distinct from
     /// the `update` topic [`AlertRegistry::update_alert`] emits, so an indexer
@@ -4254,9 +4238,6 @@ impl AlertRegistry {
             .extend_ttl(&key, DEFAULT_TTL, DEFAULT_TTL);
     }
 
-    /// Reject registration once the total number of live alerts
-    /// (the monotonic [`instance_key::NEXT_ID`] counter) reaches the
-    /// configured global ceiling. A limit of `0` means no ceiling.
     /// Reject registration once the number of **live** alerts (the
     /// [`instance_key::LIVE`] counter, not the monotonic
     /// [`instance_key::NEXT_ID`] registration total) reaches the configured
