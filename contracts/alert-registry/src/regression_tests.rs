@@ -2266,6 +2266,45 @@ fn test_regression_snooze_tags_and_renew_events_include_caller_and_ttl() {
     assert_eq!(caller, owner);
     assert_eq!(ttl, crate::DEFAULT_TTL);
     assert_eq!(version, crate::EVENT_SCHEMA_VERSION);
+/// Regression test for #604: config-change events carry the previous value
+/// alongside the new one (and a schema version), so auditors do not have to
+/// replay every earlier event to learn what changed. The exact payload shape
+/// is pinned here so a future change to the tuple is caught.
+#[test]
+fn test_regression_config_change_events_include_old_value() {
+    let (env, admin, client) = setup();
+    let registry = Address::generate(&env);
+
+    // admin.limit: (schema_version, old, new)
+    client.set_per_owner_alert_limit(&admin, &10);
+    client.set_per_owner_alert_limit(&admin, &25);
+    let (version, old, new): (u32, u32, u32) =
+        FromVal::from_val(&env, &last_admin_event(&env, symbol_short!("limit")));
+    assert_eq!((version, old, new), (crate::EVENT_SCHEMA_VERSION, 10, 25));
+
+    // admin.timelock: (schema_version, old, new)
+    client.set_timelock(&admin, &100);
+    client.set_timelock(&admin, &250);
+    let (version, old, new): (u32, u32, u32) =
+        FromVal::from_val(&env, &last_admin_event(&env, symbol_short!("timelock")));
+    assert_eq!((version, old, new), (crate::EVENT_SCHEMA_VERSION, 100, 250));
+
+    // admin.watchreg: (schema_version, old, new)
+    client.set_watcher_registry(&admin, &registry);
+    let (version, old, new): (u32, Option<Address>, Option<Address>) =
+        FromVal::from_val(&env, &last_admin_event(&env, symbol_short!("watchreg")));
+    assert_eq!(
+        (version, old, new),
+        (crate::EVENT_SCHEMA_VERSION, None, Some(registry.clone()))
+    );
+
+    client.clear_watcher_registry(&admin);
+    let (version, old, new): (u32, Option<Address>, Option<Address>) =
+        FromVal::from_val(&env, &last_admin_event(&env, symbol_short!("watchreg")));
+    assert_eq!(
+        (version, old, new),
+        (crate::EVENT_SCHEMA_VERSION, Some(registry), None)
+    );
 }
 
 /// Regression test for #363: removing an ID that is absent from the contract

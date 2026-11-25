@@ -37,12 +37,32 @@ The exception is `DataKey::PendingTransfer(id)`, which uses
 For each key's tier and value type, see [docs/storage.md](storage.md).
 
 The `watcher-registry` keeps its admins, watchers and timelock in **instance
+The `watcher-registry` keeps its admin, watcher list and timelock in **instance
 storage**, which has its own TTL managed by the network. No registry entrypoint
 extends it as a side effect, so see
 [Keeping the watcher registry alive](#keeping-the-watcher-registry-alive) below.
 Its per-watcher metadata (registration ledger, label and similar bookkeeping)
 lives in persistent entries written with `DEFAULT_TTL` and refreshed by the
 registry's own mutators.
+
+It also has **two persistent keys**, both written with `DEFAULT_TTL` and
+extended on every read and write:
+
+- `DataKey::WatcherInfo(address)` — the per-watcher `label` and `operator`
+  metadata set by `set_watcher_info`
+- `DataKey::WatcherScope(address)` — the per-watcher scope list set by
+  `set_watcher_scope`
+
+Both setters require the address to be a registered watcher, reject labels and
+operators longer than `MAX_WATCHER_LABEL_LEN` / `MAX_WATCHER_OPERATOR_LEN`, and
+reject scope vectors longer than `MAX_WATCHER_SCOPE_LEN` (each scope string is
+capped at `MAX_WATCHER_SCOPE_ITEM_LEN`). They also honour the registry pause
+flag. Because the entries are persistent, they are not loaded on every
+invocation and cannot push the instance entry past its size limit. Reads
+(`get_watcher_info`, `get_watcher_scope`) extend the TTL of the entry they
+return, so a watcher that is queried regularly stays live; an entry that is
+never read or rewritten expires after `DEFAULT_TTL` and reads back as absent.
+=======
 
 ## Non-Default TTLs
 
@@ -99,11 +119,14 @@ TTL.
 
 ## Keeping the Watcher Registry Alive
 
-All `WatcherRegistry` state (admins, watchers, timelock) lives in a single
+The `WatcherRegistry` admin, watcher list and timelock live in a single
 instance entry. Its TTL is only refreshed when a transaction touches the
 contract — and a registry whose watchers are registered once and then rarely
 changed may go untouched long enough for the entry to be archived, taking the
-whole registry offline until it is restored for a fee.
+whole registry offline until it is restored for a fee. (The per-watcher
+`WatcherInfo` and `WatcherScope` entries are persistent and are not affected by
+instance archival; see above.)
+=======
 
 `bump_instance_ttl` is the keep-alive entrypoint:
 
