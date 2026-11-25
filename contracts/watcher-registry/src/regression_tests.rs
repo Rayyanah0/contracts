@@ -664,3 +664,104 @@ fn test_regression_pending_action_cancelled_on_proposer_removal() {
     assert_eq!(res.unwrap_err().unwrap(), ContractError::NoPendingAction);
     assert!(!client.is_admin(&third_admin));
 }
+
+/// Regression test for #597: while the registry is paused, a pending admin
+/// transfer cannot be accepted, but it can still be cancelled.
+#[test]
+fn test_regression_accept_admin_transfer_blocked_while_paused() {
+    let (env, admin, client) = setup();
+    let new_admin = Address::generate(&env);
+
+    client.propose_admin_transfer(&admin, &new_admin);
+    client.pause(&admin);
+
+    let res = client.try_accept_admin_transfer(&new_admin);
+    assert_eq!(
+        res.unwrap_err().unwrap(),
+        ContractError::Paused,
+        "Accepting an admin transfer must be blocked while paused"
+    );
+    assert!(!client.is_admin(&new_admin));
+
+    // Cancelling remains allowed while paused so a suspected takeover can be
+    // aborted without unpausing.
+    assert_eq!(
+        client.try_cancel_admin_transfer(&admin).unwrap(),
+        Ok(())
+    );
+    assert_eq!(
+        client.try_accept_admin_transfer(&new_admin).unwrap_err().unwrap(),
+        ContractError::NoPendingTransfer
+    );
+}
+
+/// Test for #600: `set_watcher_scope` deduplicates entries and rejects the
+/// registry's own address and the watcher's own address.
+#[test]
+fn test_set_watcher_scope_validates_targets() {
+    let (env, admin, client) = setup();
+    let watcher = Address::generate(&env);
+    let target_a = Address::generate(&env);
+    let target_b = Address::generate(&env);
+    client.register_watcher(&admin, &watcher);
+
+    // Duplicates are collapsed while preserving order.
+    let scope = soroban_sdk::vec![
+        &env,
+        target_a.clone(),
+        target_b.clone(),
+        target_a.clone(),
+        target_b.clone(),
+    ];
+    client.set_watcher_scope(&admin, &watcher, &scope);
+    let stored = client.get_watcher_scope(&watcher);
+    assert_eq!(stored.len(), 2);
+    assert_eq!(stored.get(0).unwrap(), target_a);
+    assert_eq!(stored.get(1).unwrap(), target_b);
+
+    // The registry's own address is not a valid target.
+    let registry_id = client.address.clone();
+    let res = client.try_set_watcher_scope(
+        &admin,
+        &watcher,
+        &soroban_sdk::vec![&env, registry_id],
+    );
+    assert_eq!(res.unwrap_err().unwrap(), ContractError::InvalidScopeTarget);
+
+    // The watcher itself is not a valid target.
+    let res = client.try_set_watcher_scope(
+        &admin,
+        &watcher,
+        &soroban_sdk::vec![&env, watcher.clone()],
+    );
+    assert_eq!(res.unwrap_err().unwrap(), ContractError::InvalidScopeTarget);
+
+    // The previously stored scope is unchanged after rejected updates.
+    assert_eq!(client.get_watcher_scope(&watcher), stored);
+}
+
+/// Test for #603: the constructor records the current schema version and
+/// `migrate` validates its arguments.
+#[test]
+fn test_schema_version_and_migrate_validation() {
+    let (_env, _admin, client) = setup();
+
+    assert_eq!(client.get_schema_version(), CURRENT_SCHEMA_VERSION);
+
+    // `from` must match the stored schema version.
+    let res = client.try_migrate(&(CURRENT_SCHEMA_VERSION + 1), &CURRENT_SCHEMA_VERSION);
+    assert_eq!(res.unwrap_err().unwrap(), ContractError::SchemaMismatch);
+
+    // `to` must be strictly greater than `from`.
+    let res = client.try_migrate(&CURRENT_SCHEMA_VERSION, &CURRENT_SCHEMA_VERSION);
+    assert_eq!(res.unwrap_err().unwrap(), ContractError::InvalidSchemaVersion);
+
+    // A valid migration advances the stored version.
+    assert_eq!(
+        client
+            .try_migrate(&CURRENT_SCHEMA_VERSION, &(CURRENT_SCHEMA_VERSION + 1))
+            .unwrap(),
+        Ok(())
+    );
+    assert_eq!(client.get_schema_version(), CURRENT_SCHEMA_VERSION + 1);
+}
