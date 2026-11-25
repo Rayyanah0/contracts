@@ -32,6 +32,13 @@
 // (e.g. `watcher_registry.ts`) and exports `Client`, error types, and all
 // XDR-mapped TypeScript types. We re-export them wholesale so consumers
 // only need to import from this package.
+//
+// Note: `are_watchers_authorized` now returns a `Result` rather than a bare
+// `Vec<bool>`. Oversized batches (more than `MAX_PAGE_SIZE` watcher IDs) are
+// rejected with an error instead of being silently truncated, so callers can
+// no longer zip the returned array with their input without checking for
+// failure. The generated `Client` surfaces this as a thrown error carrying the
+// contract error code; the corresponding error type is re-exported below.
 export * from "./watcher_registry.js";
 
 // ── Governance helpers ────────────────────────────────────────────────────────

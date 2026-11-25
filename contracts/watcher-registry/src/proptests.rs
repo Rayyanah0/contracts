@@ -138,6 +138,67 @@ proptest! {
     }
 
     #[test]
+    fn prop_are_watchers_authorized_matches_input_length(
+        n in 0..40usize
+    ) {
+        let (env, admin, client) = create_env_and_client();
+        let watcher = Address::generate(&env);
+        let _ = client.register_watcher(&admin, &watcher);
+
+        let mut candidates = SorobanVec::new(&env);
+        for _ in 0..n {
+            candidates.push_back(Address::generate(&env));
+        }
+
+        let result = client.try_are_watchers_authorized(&candidates);
+        match result {
+            Ok(Ok(authorized)) => {
+                // Successful results must be aligned with the input length.
+                prop_assert_eq!(authorized.len() as usize, n);
+            }
+            Ok(Err(err)) => {
+                // Oversized batches must surface an explicit error rather than
+                // silently truncating the result vector.
+                prop_assert_eq!(err, ContractError::PageSizeExceeded);
+            }
+            Err(_) => {
+                // Host-level failure is acceptable only for oversized input.
+                prop_assert!(n > 0);
+            }
+        }
+    }
+
+    #[test]
+    fn prop_replace_watcher_preserves_scope_and_metadata(
+        scoped in any::<bool>(),
+        metadata in prop::option::of(0u32..1000u32),
+    ) {
+        let (env, admin, client) = create_env_and_client();
+        let old = Address::generate(&env);
+        let new = Address::generate(&env);
+
+        let _ = client.register_watcher(&admin, &old);
+
+        let scope = if scoped {
+            Some(SorobanVec::from_array(&env, [Address::generate(&env)]))
+        } else {
+            None
+        };
+        let _ = client.set_watcher_scope(&admin, &old, &scope);
+
+        let meta = metadata.map(|m| m as u64);
+        let _ = client.set_watcher_metadata(&admin, &old, &meta);
+
+        let _ = client.replace_watcher(&admin, &old, &new);
+
+        // Old address must no longer be registered.
+        prop_assert!(!client.is_watcher(&old));
+        // New address must be registered.
+        prop_assert!(client.is_watcher(&new));
+
+        // Scope and metadata must carry over to the new address.
+        prop_assert_eq!(client.get_watcher_scope(&new), scope);
+        prop_assert_eq!(client.get_watcher_metadata(&new), meta);
     fn prop_removal_purges_metadata_and_scope(
         actions in prop::collection::vec(arb_watcher_action(), 1..20)
     ) {

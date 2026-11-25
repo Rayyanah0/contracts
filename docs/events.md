@@ -762,11 +762,18 @@ Emitted when an existing watcher address is atomically replaced with a new watch
 |---|---|
 | Topic 0 | `Symbol("watcher")` |
 | Topic 1 | `Symbol("replace")` |
-| Data | `(old_watcher: Address, new_watcher: Address)` |
+| Data | `(old_watcher: Address, new_watcher: Address, scope: WatcherScope)` |
 
 > A self-replace (`old_watcher == new_watcher`) is a no-op: the address stays
 > authorized throughout, so neither `watcher.replace` nor `watcher.remove` is
 > emitted.
+
+> **Metadata and scope are carried over.** `replace_watcher` is the key-rotation
+> path: the new address inherits the old watcher's `WatcherInfo` (metadata) and
+> `WatcherScope` (authorization scope) unchanged. The new address is **not**
+> unscoped — it is authorized for exactly the same targets as the old one. The
+> carried-over `scope` is included in the event data so indexers can update
+> their view of the replacement without a follow-up `get_watcher` call.
 
 **Status:** ✅ implemented (`replace_watcher`)
 
@@ -814,6 +821,27 @@ If you only need revocations, subscribing to `watcher.remove` alone is
 sufficient — `replace_watcher` always emits it. Subscribe to
 `watcher.replace` as well only when you also need the `new_watcher` half of
 the rotation.
+
+---
+
+### `watcher.info`
+
+Emitted when a watcher's metadata (`WatcherInfo`) is set or cleared via
+`set_watcher_info`.
+
+| Field | Value |
+|---|---|
+| Topic 0 | `Symbol("watcher")` |
+| Topic 1 | `Symbol("info")` |
+| Data (set) | `(watcher: Address, info: Option<WatcherInfo>)` where `info` is `Some(...)` |
+| Data (clear) | `(watcher: Address, info: Option<WatcherInfo>)` where `info` is `None` |
+
+Both shapes use the same topics and the same tuple layout; the only difference
+is whether the `Option` is `Some` or `None`. Clearing metadata emits the event
+with a `None` payload so indexers can drop stale metadata instead of continuing
+to display the previously-set values.
+
+**Status:** ✅ implemented (`set_watcher_info`)
 
 ---
 
@@ -912,15 +940,21 @@ called directly or executed through the timelock.
 
 ---
 
-### `admin.propose`
+### `admin.queue`
 
-Emitted when a sensitive admin action is queued behind the timelock.
+Emitted when a sensitive admin action is queued behind the timelock via
+`propose_admin_action`. A distinct `queue` action (rather than `propose`) is
+used so it does not clash with admin-transfer proposals.
 
 | Field | Value |
 |---|---|
 | Topic 0 | `Symbol("admin")` |
-| Topic 1 | `Symbol("propose")` |
-| Data | `(proposer: Address, ready_at: u32)` |
+| Topic 1 | `Symbol("queue")` |
+| Data | `(proposer: Address, ready_at: u32, action: AdminAction)` |
+
+`AdminAction` is the queued action enum, e.g. `Upgrade(wasm_hash)` or
+`TransferAdmin(addr)`, so co-admins can tell from the event alone what was
+queued without calling `get_pending_action`.
 
 **Status:** ✅ implemented (`propose_admin_action`)
 

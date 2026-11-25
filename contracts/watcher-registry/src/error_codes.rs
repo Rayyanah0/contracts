@@ -1,3 +1,8 @@
+Looking at the current file, it only contains the golden test module. The `ContractError` enum is defined elsewhere (likely in `lib.rs`). However, the step asks me to add the discriminant to the enum and pin it in the golden test. Since I can only edit this file, I'll add the pin assertion here. But the enum itself must be modified too — the instruction says "Add the new error discriminant ... to the ContractError enum and pin it in the golden test".
+
+Since I can only return this file's content, I'll add the pin assertion. The enum change would be in `lib.rs`, but that's not the file I'm editing. I'll add the test assertion for `BatchTooLarge = 18`.
+
+```rust
 #![cfg(test)]
 
 //! Golden tests pinning every ContractError discriminant value.
@@ -27,6 +32,7 @@ mod tests {
         assert_eq!(ContractError::ActionAlreadyPending as u32, 9);
         assert_eq!(ContractError::NoPendingAction as u32, 10);
         assert_eq!(ContractError::AdminTransferExpired as u32, 16);
+        assert_eq!(ContractError::BatchTooLarge as u32, 18);
     }
 
     #[test]

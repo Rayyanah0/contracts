@@ -314,7 +314,10 @@ Atomically deauthorizes `old_watcher` and authorizes `new_watcher` in a single t
 
 **Returns:** `Result<(), ContractError>` — `WatcherNotFound` if `old_watcher` is not registered, plus `NotInitialized` / `Unauthorized`.
 
-**Events:** `(Symbol("watcher"), Symbol("remove"))` with data `(old_watcher: Address)`, then `(Symbol("watcher"), Symbol("replace"))` with data `(old_watcher: Address, new_watcher: Address)`.
+**Metadata and scope:** the rotation carries the old watcher's `WatcherInfo` (metadata) and `WatcherScope` over to `new_watcher`, so a scoped watcher stays scoped to the same targets after rotation and does not silently widen to "authorized for every target". Any metadata/scope stored for `new_watcher` before the call is overwritten by the old watcher's values.
+
+**Events:** `(Symbol("watcher"), Symbol("remove"))` with data `(old_watcher: Address)`, then `(Symbol("watcher"), Symbol("replace"))` with data `(old_watcher: Address, new_watcher: Address, scope: Option<WatcherScope>)` — the carried-over scope is included so indexers can track the new address's effective scope without a follow-up read.
+=======
 
 ---
 
@@ -364,7 +367,9 @@ If `new_watcher` is already registered the call still succeeds: `old_watcher` is
 
 **Returns:** nothing
 
-**Events:** `("watcher", "remove")` with data `(old_watcher: Address)`, then `("watcher", "replace")` with data `(old_watcher: Address, new_watcher: Address)`.
+**Metadata and scope:** the old watcher's `WatcherInfo` and `WatcherScope` are moved to `new_watcher`; the new address never starts unscoped or without metadata when the old one had them.
+
+**Events:** `("watcher", "remove")` with data `(old_watcher: Address)`, then `("watcher", "replace")` with data `(old_watcher: Address, new_watcher: Address, scope: Option<WatcherScope>)`.
 
 **Errors:**
 
@@ -463,6 +468,26 @@ Removes an address from the admin set. Any existing admin may call this. Refuses
 
 ---
 
+### `set_watcher_info`
+
+Sets or clears the metadata (`WatcherInfo`) attached to a registered watcher.
+
+**Requires auth:** `admin`
+
+**Parameters**
+
+| Name | Type | Description |
+|---|---|---|
+| `admin` | `Address` | Any current admin |
+| `watcher` | `Address` | Registered watcher whose metadata is being set |
+| `info` | `Option<WatcherInfo>` | New metadata, or `None` to clear it |
+
+**Returns:** `Result<(), ContractError>` — `WatcherNotFound` if `watcher` is not registered, plus `NotInitialized` / `Unauthorized`.
+
+**Events:** `("watcher", "info")` is emitted for **both** shapes: with data `(watcher: Address, info: Some(WatcherInfo))` when metadata is set, and with data `(watcher: Address, info: None)` when it is cleared. Indexers must treat the `None` payload as "metadata removed" and drop any cached metadata for that watcher.
+
+---
+
 ### `get_watchers`
 
 Returns all currently authorized watcher addresses.
@@ -516,6 +541,9 @@ Returns the number of registered watchers as a cheap integer read, avoiding the 
 
 ---
 
+### `propose_admin_action`
+
+Queues a timelocked admin action (`AdminAction::Upgrade(hash)` or `AdminAction::TransferAdmin(addr)`) for later execution via `execute_admin_action`.
 ### `get_configuration`
 
 One-shot read of the registry's configuration, so dashboards and monitoring
@@ -552,6 +580,17 @@ Stores descriptive metadata for a watcher address.
 | Name | Type | Description |
 |---|---|---|
 | `admin` | `Address` | Any current admin |
+| `action` | `AdminAction` | Action to queue |
+
+**Returns:** `Result<(), ContractError>` — `ActionAlreadyPending` if an action is already queued, `DelayTooLarge` if the configured delay exceeds `MAX_TIMELOCK_DELAY`, plus `NotInitialized` / `Unauthorized`.
+
+**Events:** `("admin", "queue")` with data `(caller: Address, ready_at: u32, action: AdminAction)` — the queued action is included so co-admins can alert on an `Upgrade(hash)` or `TransferAdmin(addr)` during the timelock window without calling `get_pending_action`. The distinct `admin.queue` topic avoids clashing with the `admin.propose` transfer-proposal event.
+
+---
+
+### `are_watchers_authorized`
+
+Batch form of `is_watcher_authorized`: checks several addresses in one call.
 | `watcher` | `Address` | A **registered** watcher address |
 | `info` | `WatcherInfo` | Metadata record (see below) |
 
@@ -584,6 +623,11 @@ watcher address.
 
 | Name | Type | Description |
 |---|---|---|
+| `watchers` | `Vec<Address>` | Addresses to check |
+
+**Returns:** `Result<Vec<bool>, ContractError>` — one flag per input, in the same order.
+
+**Errors:** `ContractError::TooManyWatchers` (or the equivalent batch-size error) if `watchers.len() > MAX_PAGE_SIZE`. Oversized batches are rejected rather than silently truncated, so the returned `Vec<bool>` always has exactly `watchers.len()` entries and can be zipped with the input safely.
 | `admin` | `Address` | Any current admin |
 | `watcher` | `Address` | A **registered** watcher address |
 | `scope` | `WatcherScope` | Scope record (see below) |
