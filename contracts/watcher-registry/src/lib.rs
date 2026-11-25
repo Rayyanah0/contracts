@@ -1597,6 +1597,7 @@ impl WatcherRegistry {
     /// Returns [`ContractError::AdminAlreadyExists`] if `action` is [`AdminAction::AddAdmin`] for an existing admin.
     /// Returns [`ContractError::MaxAdminsReached`] if `action` is [`AdminAction::AddAdmin`] and the admin set is full.
     /// Returns [`ContractError::DelayTooLarge`] if `action` is [`AdminAction::SetTimelockDelay`] above [`MAX_TIMELOCK_DELAY`].
+    /// Lowering the delay is allowed here: it is itself a timelocked change.
     ///
     /// Note: [`AdminAction::Upgrade`] is not pre-validated here — whether a
     /// WASM hash is installed is a host-level check that
