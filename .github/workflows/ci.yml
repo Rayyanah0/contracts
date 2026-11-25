@@ -227,6 +227,13 @@ jobs:
       - name: Generate code coverage
         run: cargo llvm-cov --workspace --locked --lcov --output-path lcov.info
 
+      # Per-crate line-coverage floors (threshold not yet calibrated; see docs/testing.md)
+      - name: Enforce alert-registry coverage floor
+        run: cargo llvm-cov -p alert-registry --locked --fail-under-lines 60
+
+      - name: Enforce watcher-registry coverage floor
+        run: cargo llvm-cov -p watcher-registry --locked --fail-under-lines 60
+
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v7
         with:
