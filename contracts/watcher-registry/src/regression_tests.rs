@@ -97,35 +97,25 @@ fn test_regression_remove_watcher_unregistered_emits_no_event() {
     );
 }
 
-/// Regression test for historical bug:
-/// `clear_all_watchers emits one event per removed watcher.`
-///
-/// Ensures that clearing all watchers emits individual `("watcher", "remove")`
-/// events for all removed addresses so off-chain systems immediately revoke trust.
+/// Regression test for #592: `clear_all_watchers` clears every watcher except
+/// the kept set, emitting one `("watcher", "remove")` event per removed
+/// watcher, and the kept watchers remain authorized.
 #[test]
-fn test_regression_clear_all_watchers_emits_one_event_per_removed_watcher() {
+fn test_regression_clear_all_watchers_keeps_kept_set() {
     let (env, admin, client) = setup();
     let w1 = Address::generate(&env);
     let w2 = Address::generate(&env);
+    let kept = Address::generate(&env);
 
     client.register_watcher(&admin, &w1);
     client.register_watcher(&admin, &w2);
-    assert_eq!(client.get_watcher_count(), 2);
+    client.register_watcher(&admin, &kept);
+    assert_eq!(client.get_watcher_count(), 3);
 
-    client.clear_all_watchers(&admin);
+    let keep = soroban_sdk::vec![&env, kept.clone()];
+    client.clear_all_watchers(&admin, &keep);
 
     let events = env.events().all();
-    let events = events.events();
-    // Should have emitted 2 remove events (one for each removed watcher)
-    assert_eq!(events.len(), 2);
-    for event in events.iter() {
-        let v0 = match &event.body {
-            soroban_sdk::xdr::ContractEventBody::V0(v0) => v0,
-        };
-        assert_eq!(v0.topics.len(), 2);
-        let emitted_addr: Address = soroban_sdk::TryFromVal::try_from_val(&env, &v0.data)
-            .expect("event data decodes as an address");
-        assert!(emitted_addr == w1 || emitted_addr == w2);
     let mut removed = 0;
     for i in 0..events.len() {
         let (_, topics, data) = events.get(i).unwrap();
@@ -142,8 +132,25 @@ fn test_regression_clear_all_watchers_emits_one_event_per_removed_watcher() {
     }
     assert_eq!(removed, 2);
 
-    assert_eq!(client.get_watcher_count(), 0);
-    assert_eq!(client.get_watchers().len(), 0);
+    assert_eq!(client.get_watcher_count(), 1);
+    assert_eq!(client.get_watchers().len(), 1);
+    assert!(client.is_watcher_authorized(&kept));
+    assert!(!client.is_watcher_authorized(&w1));
+    assert!(!client.is_watcher_authorized(&w2));
+}
+
+/// Regression test for #592: clearing all but an empty kept set is rejected
+/// because it would leave the registry below `MIN_WATCHERS`.
+#[test]
+fn test_regression_clear_all_watchers_rejects_empty_kept_set() {
+    let (env, admin, client) = setup();
+    let w1 = Address::generate(&env);
+    client.register_watcher(&admin, &w1);
+
+    let empty: Vec<Address> = soroban_sdk::vec![&env];
+    let res = client.try_clear_all_watchers(&admin, &empty);
+    assert_eq!(res.unwrap_err().unwrap(), ContractError::BelowMinWatchers);
+    assert_eq!(client.get_watcher_count(), 1);
 }
 
 /// Regression test for historical bug:
@@ -347,6 +354,144 @@ fn test_are_watchers_authorized_batch_query() {
     );
 }
 
+/// Regression test for #594: removing a watcher must delete its metadata and
+/// scope so a re-registered address starts unscoped and without metadata.
+#[test]
+fn test_regression_remove_watcher_clears_metadata_and_scope() {
+    let (env, admin, client) = setup();
+    let watcher = Address::generate(&env);
+    let target = Address::generate(&env);
+    client.register_watcher(&admin, &watcher);
+
+    let info = WatcherInfo {
+        label: String::from_str(&env, "keeper"),
+        operator: String::from_str(&env, "Acme"),
+    };
+    client.set_watcher_info(&admin, &watcher, &Some(info));
+    client.set_watcher_scope(&admin, &watcher, &soroban_sdk::vec![&env, target.clone()]);
+    assert!(!client.get_watcher_scope(&watcher).is_empty());
+
+    client.remove_watcher(&admin, &watcher);
+    assert!(client.get_watcher_info(&watcher).is_none());
+    assert!(client.get_watcher_scope(&watcher).is_empty());
+
+    // Re-registering the same address starts unscoped and without metadata.
+    client.register_watcher(&admin, &watcher);
+    assert!(client.get_watcher_info(&watcher).is_none());
+    assert!(client.get_watcher_scope(&watcher).is_empty());
+    assert!(client.is_watcher_authorized_for(&watcher, &target));
+}
+
+/// Regression test for #594: `clear_watchers_batch` must also delete the
+/// metadata and scope of every removed watcher.
+#[test]
+fn test_regression_clear_watchers_batch_clears_metadata_and_scope() {
+    let (env, admin, client) = setup();
+    let w1 = Address::generate(&env);
+    let w2 = Address::generate(&env);
+    let target = Address::generate(&env);
+    client.register_watcher(&admin, &w1);
+    client.register_watcher(&admin, &w2);
+
+    let info = WatcherInfo {
+        label: String::from_str(&env, "keeper"),
+        operator: String::from_str(&env, "Acme"),
+    };
+    client.set_watcher_info(&admin, &w1, &Some(info));
+    client.set_watcher_scope(&admin, &w1, &soroban_sdk::vec![&env, target.clone()]);
+
+    client.clear_watchers_batch(&admin, &soroban_sdk::vec![&env, w1.clone(), w2.clone()]);
+
+    assert!(client.get_watcher_info(&w1).is_none());
+    assert!(client.get_watcher_scope(&w1).is_empty());
+    assert!(client.get_watcher_info(&w2).is_none());
+    assert!(client.get_watcher_scope(&w2).is_empty());
+}
+
+/// Regression test for #591: a lower timelock delay can be proposed through
+/// `propose_admin_action` and applied once the timelock elapses.
+#[test]
+fn test_regression_propose_lower_timelock_delay_then_execute() {
+    use soroban_sdk::testutils::Ledger as _;
+
+    let (env, admin, client) = setup();
+    client.set_timelock_delay(&admin, &100);
+    assert_eq!(client.get_timelock_delay(), 100);
+
+    client.propose_admin_action(&admin, &AdminAction::SetTimelockDelay(10));
+    env.ledger().with_mut(|li| li.sequence_number += 101);
+    client.execute_admin_action(&admin);
+    assert_eq!(client.get_timelock_delay(), 10);
+}
+
+/// Regression test for #591: the timelock delay can be disabled (set to zero)
+/// through `propose_admin_action` and executed after the timelock elapses.
+#[test]
+fn test_regression_propose_disable_timelock_delay() {
+    use soroban_sdk::testutils::Ledger as _;
+
+    let (env, admin, client) = setup();
+    client.set_timelock_delay(&admin, &50);
+    assert_eq!(client.get_timelock_delay(), 50);
+
+    client.propose_admin_action(&admin, &AdminAction::SetTimelockDelay(0));
+    env.ledger().with_mut(|li| li.sequence_number += 51);
+    client.execute_admin_action(&admin);
+    assert_eq!(client.get_timelock_delay(), 0);
+}
+
+/// Regression test for #591: the direct `set_timelock_delay` setter stays
+/// raise-only and rejects lowering the delay.
+#[test]
+fn test_regression_set_timelock_delay_direct_is_raise_only() {
+    let (_env, admin, client) = setup();
+    client.set_timelock_delay(&admin, &100);
+
+    let res = client.try_set_timelock_delay(&admin, &10);
+    assert_eq!(res.unwrap_err().unwrap(), ContractError::TimelockRequired);
+    assert_eq!(client.get_timelock_delay(), 100);
+}
+
+/// Regression test for #601: the guardian can pause the registry but cannot
+/// unpause it, and the admin can rotate the guardian.
+#[test]
+fn test_regression_guardian_can_pause_but_not_unpause() {
+    let (env, admin, client) = setup();
+    let guardian = Address::generate(&env);
+
+    assert!(client.get_guardian().is_none());
+    client.set_guardian(&admin, &Some(guardian.clone()));
+    assert_eq!(client.get_guardian(), Some(guardian.clone()));
+
+    client.pause(&guardian);
+    assert!(client.is_paused());
+
+    let res = client.try_unpause(&guardian);
+    assert_eq!(res.unwrap_err().unwrap(), ContractError::Unauthorized);
+    assert!(client.is_paused());
+
+    // Admin can still unpause and rotate the guardian.
+    client.unpause(&admin);
+    assert!(!client.is_paused());
+
+    let new_guardian = Address::generate(&env);
+    client.set_guardian(&admin, &Some(new_guardian.clone()));
+    assert_eq!(client.get_guardian(), Some(new_guardian));
+
+    client.set_guardian(&admin, &None);
+    assert!(client.get_guardian().is_none());
+}
+
+/// Regression test for #601: only an admin may set the guardian.
+#[test]
+fn test_regression_set_guardian_requires_admin() {
+    let (env, _admin, client) = setup();
+    let not_admin = Address::generate(&env);
+    let guardian = Address::generate(&env);
+
+    let res = client.try_set_guardian(&not_admin, &Some(guardian));
+    assert_eq!(res.unwrap_err().unwrap(), ContractError::Unauthorized);
+    assert!(client.get_guardian().is_none());
 /// Regression test for #593: `set_watcher_info` must reject unregistered
 /// watchers, labels/operators exceeding the caps, and calls while paused.
 #[test]

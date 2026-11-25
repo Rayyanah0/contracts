@@ -30,6 +30,22 @@ mod tests {
     }
 
     #[test]
+    fn test_guardian_error_codes_are_stable() {
+        // Guardian role error codes (#601). These are new discriminants appended
+        // after the existing range so that previously pinned values remain stable.
+        // Documented in the CHANGELOG as an additive (non-breaking) ABI change.
+        assert_eq!(ContractError::GuardianNotSet as u32, 17);
+        assert_eq!(ContractError::NotGuardian as u32, 18);
+    }
+
+    #[test]
+    fn test_clear_all_watchers_error_codes_are_stable() {
+        // clear_all_watchers was redefined as "clear all but a kept set" (#592).
+        // The BelowMinWatchers error is retained for the case where the kept set
+        // would leave fewer than MIN_WATCHERS watchers, and a new error is added
+        // for an invalid kept set. Existing discriminants are unchanged.
+        assert_eq!(ContractError::BelowMinWatchers as u32, 19);
+        assert_eq!(ContractError::InvalidKeptSet as u32, 20);
     fn test_length_limit_error_codes_are_stable() {
         // GH #593: length-limit error variants for watcher metadata and scopes.
         // These discriminants are part of the public ABI; pin them so they stay stable.

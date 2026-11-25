@@ -605,6 +605,14 @@ Emitted when a watcher address is de-authorised.
 > actually present in the registry — removing an unregistered address is a
 > silent no-op.
 
+> **Bulk clearing.** `clear_all_watchers` (and the timelocked
+> `AdminAction::ClearAllWatchers`) deauthorizes every watcher *except* a
+> caller-supplied kept set, emitting one `watcher.remove` per revoked address.
+> The kept set is never revoked, so the operation can succeed even while
+> `MIN_WATCHERS` watchers remain registered. Passing an empty kept set is
+> rejected with `BelowMinWatchers` when it would leave fewer than
+> `MIN_WATCHERS` watchers registered.
+
 > **Emitted alongside `watcher.replace`.** `replace_watcher` emits *both* a
 > `watcher.remove` for `old_watcher` and a `watcher.replace` carrying the same
 > `old_watcher`. A listener that reacts to both event types will see the old
@@ -819,16 +827,41 @@ emitted alongside it.
 
 ---
 
+### `admin.guardian`
+
+Emitted when the guardian role is set or cleared via `set_guardian`. A `None`
+guardian means the role is unassigned.
+
+| Field | Value |
+|---|---|
+| Topic 0 | `Symbol("admin")` |
+| Topic 1 | `Symbol("guardian")` |
+| Data | `(admin: Address, guardian: Option<Address>)` |
+
+> The guardian is a pause-only role: it may call `pause` but never `unpause`,
+> and cannot upgrade the contract, change limits, or manage watchers. Assign it
+> to on-call responders or monitoring bots that need to trip the
+> circuit-breaker without holding full admin authority. Mirrors
+> [`AlertRegistry`'s `admin.guardian`](#adminguardian).
+
+**Status:** ✅ implemented (`set_guardian`)
+
+---
+
 ### `admin.pause`
 
-Emitted when an admin pauses the registry with `pause`. Mutating calls are
-rejected until `admin.unpause` is emitted.
+Emitted when an admin — or the guardian — pauses the registry with `pause`.
+Mutating calls are rejected until `admin.unpause` is emitted.
 
 | Field | Value |
 |---|---|
 | Topic 0 | `Symbol("admin")` |
 | Topic 1 | `Symbol("pause")` |
 | Data | `(caller: Address,)` |
+
+> The `caller` field carries the address that paused the registry, which may be
+> either an admin or the guardian (see
+> [`admin.guardian`](#adminguardian-1)). Only an admin can `unpause`.
 
 **Status:** ✅ implemented (`pause`)
 

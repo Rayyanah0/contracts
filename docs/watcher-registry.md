@@ -318,7 +318,7 @@ Atomically deauthorizes `old_watcher` and authorizes `new_watcher` in a single t
 
 ### `clear_all_watchers`
 
-Bulk-deauthorizes every registered watcher in one admin call and resets the watcher counter to zero.
+Deauthorizes every registered watcher **except** the addresses in `keep`, in one admin call. Because `MIN_WATCHERS` (1) must always hold, the call requires at least one address to be kept: `keep` must be non-empty and every address in it must already be a registered watcher. The watcher counter is updated to the size of the kept set.
 
 **Requires auth:** `admin`
 
@@ -327,16 +327,20 @@ Bulk-deauthorizes every registered watcher in one admin call and resets the watc
 | Name | Type | Description |
 |---|---|---|
 | `admin` | `Address` | Any current admin |
+| `keep` | `Vec<Address>` | Watcher addresses to retain; must be non-empty and all currently registered |
 
-**Events:** `("watcher", "remove")` with data `(watcher: Address)` — emitted only when the watcher was actually present. Dependent systems must subscribe to this event to revoke trust immediately.
+**Returns:** `Result<(), ContractError>` — `NotInitialized` / `Unauthorized` / `BelowMinWatchers` (empty `keep`) / `WatcherNotFound` (a kept address is not registered).
+
+**Events:** one `(Symbol("watcher"), Symbol("remove"))` with data `(watcher: Address)` per removed address, so dependent systems can revoke trust for each. No event is emitted for kept addresses.
 
 **Errors:**
 
 - `NotInitialized` if the contract has not been initialized.
 - `Unauthorized` if `admin` is not in the admin set.
-**Returns:** `Result<(), ContractError>` — `NotInitialized` / `Unauthorized`.
-
-**Events:** one `(Symbol("watcher"), Symbol("remove"))` with data `(watcher: Address)` per removed address, so dependent systems can revoke trust for each.
+- `BelowMinWatchers` if `keep` is empty (the registry would drop below `MIN_WATCHERS`).
+- `WatcherNotFound` if an address in `keep` is not currently registered.
+- `Paused` if the contract is paused.
+- `TimelockRequired` if a timelock delay is configured; queue `AdminAction::ClearAllWatchers(keep)` via `propose_admin_action` instead.
 
 ---
 
@@ -370,7 +374,7 @@ If `new_watcher` is already registered the call still succeeds: `old_watcher` is
 
 ### `clear_all_watchers`
 
-Removes every registered watcher in a single admin call and resets the watcher count to zero. Any admin may call this. Calling it on an empty set is a no-op.
+Removes every registered watcher except those listed in `keep`, in a single admin call. Any admin may call this. Since `MIN_WATCHERS` is 1, `keep` must contain at least one currently registered watcher; the watcher count is set to `keep.len()`.
 
 **Requires auth:** `admin`
 
@@ -379,15 +383,18 @@ Removes every registered watcher in a single admin call and resets the watcher c
 | Name | Type | Description |
 |---|---|---|
 | `admin` | `Address` | An existing admin |
+| `keep` | `Vec<Address>` | Watcher addresses to retain (non-empty, all currently registered) |
 
-**Returns:** nothing
+**Returns:** `Result<(), ContractError>` — `NotInitialized` / `Unauthorized` / `BelowMinWatchers` / `WatcherNotFound`.
 
-**Events:** one `("watcher", "remove")` per previously registered watcher, each with data `(watcher: Address)`. No events when the set was already empty.
+**Events:** one `("watcher", "remove")` per removed watcher, each with data `(watcher: Address)`. No events for kept addresses.
 
 **Errors:**
 
 - `NotInitialized` if the contract has not been initialized.
 - `Unauthorized` if `admin` is not in the admin set.
+- `BelowMinWatchers` if `keep` is empty.
+- `WatcherNotFound` if a kept address is not registered.
 
 ---
 
@@ -491,9 +498,12 @@ Returns a page of authorized watcher addresses. `offset` and `limit` are saturat
 
 ### `clear_all_watchers`
 
-Removes all registered watchers in a single call, emitting one `("watcher", "remove")` event per watcher.
+Removes all registered watchers except the addresses in `keep`, emitting one `("watcher", "remove")` event per removed watcher. `keep` must be non-empty and contain only currently registered watchers (`BelowMinWatchers` / `WatcherNotFound` otherwise).
 
 **Limitation:** with a large enough watcher set, this can exceed per-transaction resource/event limits and become unusable. Prefer `clear_watchers_batch` for large watcher sets.
+
+---
+
 ### `get_watcher_count`
 
 Returns the number of registered watchers as a cheap integer read, avoiding the cost of fetching and deserializing the full watcher list.
@@ -610,7 +620,7 @@ metadata has been stored for that address.
 
 ### `clear_watchers_batch`
 
-Removes up to `max_count` registered watchers in a single call. Batched fallback for `clear_all_watchers` — call repeatedly until `get_watcher_count` returns 0 to clear an arbitrarily large watcher set without exceeding per-transaction resource/event limits.
+Removes up to `max_count` registered watchers in a single call. Batched fallback for `clear_all_watchers` — call repeatedly until `get_watcher_count` returns the size of the set you intend to keep, without exceeding per-transaction resource/event limits. The call never drops the watcher count below `MIN_WATCHERS`.
 
 **Requires auth:** `admin`
 
@@ -623,7 +633,61 @@ Removes up to `max_count` registered watchers in a single call. Batched fallback
 
 **Returns:** nothing
 
-**Errors:** `Unauthorized` if `admin` is not an existing admin.
+**Errors:** `Unauthorized` if `admin` is not an existing admin; `BelowMinWatchers` if removing `max_count` watchers would drop the count below `MIN_WATCHERS`.
+
+---
+
+### `set_guardian`
+
+Sets the low-privilege guardian address. The guardian may `pause` the registry but may **not** `unpause` it, so on-call responders can halt mutations without holding an upgrade-capable admin key. Mirrors `AlertRegistry::set_guardian`.
+
+**Requires auth:** `admin` (must be an existing admin)
+
+**Parameters**
+
+| Name | Type | Description |
+|---|---|---|
+| `admin` | `Address` | An existing admin authorizing the change |
+| `guardian` | `Address` | Address to designate as guardian |
+
+**Returns:** `Result<(), ContractError>` — `NotInitialized` / `Unauthorized`.
+
+**Events:** `(Symbol("admin"), Symbol("guardian_set"))` with data `(guardian: Address)`.
+
+---
+
+### `get_guardian`
+
+Returns the current guardian address, if one has been set.
+
+**Parameters:** none
+
+**Returns:** `Option<Address>` — `None` if no guardian is configured.
+
+**Errors:** none (read-only call; never panics on uninitialized storage).
+
+---
+
+### `pause` / `unpause`
+
+`pause` may be called by any admin **or** the configured guardian; `unpause` may only be called by an admin. This mirrors `AlertRegistry`'s guardian semantics (#390).
+
+**Requires auth:** `caller` (admin, or guardian for `pause`)
+
+**Parameters**
+
+| Name | Type | Description |
+|---|---|---|
+| `caller` | `Address` | An admin, or the guardian when calling `pause` |
+
+**Returns:** `Result<(), ContractError>` — `NotInitialized` / `Unauthorized`.
+
+**Events:** `(Symbol("admin"), Symbol("pause"))` / `(Symbol("admin"), Symbol("unpause"))` with data `(caller: Address)`.
+
+**Errors:**
+
+- `NotInitialized` if the contract has not been initialized.
+- `Unauthorized` if `caller` is neither an admin nor (for `pause`) the guardian.
 
 ---
 
@@ -907,9 +971,9 @@ The contract defines a single error enum ([`lib.rs`](../contracts/watcher-regist
 | `AdminTransferExpired` | `16` | `accept_admin_transfer` | The pending admin transfer was proposed more than `ADMIN_TRANSFER_EXPIRY_LEDGERS` ledgers ago. |
 | `Paused` | `14` | admin and watcher mutations (`add_admin`, `remove_admin`, `accept_admin_transfer`, `register_watcher`, `remove_watcher`, `replace_watcher`, `clear_all_watchers`, …) | The contract is paused; an admin must call `unpause` first. |
 | `MaxWatchersReached` | `7` | `register_watcher` | Registering would exceed `MAX_WATCHERS`. |
-| `BelowMinWatchers` | `15` | `remove_watcher`, `clear_all_watchers` | The operation would drop the watcher count below `MIN_WATCHERS`. |
+| `BelowMinWatchers` | `15` | `remove_watcher`, `clear_all_watchers`, `clear_watchers_batch` | The operation would drop the watcher count below `MIN_WATCHERS` (e.g. an empty `keep` set). |
 | `MaxAdminsReached` | `8` | `add_admin`, `execute_admin_action` | Adding would exceed `MAX_ADMINS`. |
-| `TimelockRequired` | `13` | `add_admin`, `transfer_admin`, `propose_admin_transfer`, `clear_all_watchers`, `upgrade`, `set_timelock_delay` | A timelock delay is configured, so the action must go through `propose_admin_action` / `execute_admin_action`. From `set_timelock_delay`: the new delay is lower than the current one. |
+| `TimelockRequired` | `13` | `add_admin`, `transfer_admin`, `propose_admin_transfer`, `clear_all_watchers`, `upgrade`, `set_timelock_delay` | A timelock delay is configured, so the action must go through `propose_admin_action` / `execute_admin_action`. From `set_timelock_delay`: the new delay is lower than the current one (the direct setter is raise-only; lower it via `propose_admin_action`). |
 | `ActionAlreadyPending` | `9` | `propose_admin_action` | Another timelocked action is already queued. |
 | `NoPendingAction` | `10` | `execute_admin_action`, `cancel_admin_action` | No timelocked action is queued. |
 | `TimelockNotExpired` | `11` | `execute_admin_action` | The queued action's delay has not elapsed yet. |
@@ -925,14 +989,22 @@ See [Error handling: raw vs `try_` calls](#error-handling-raw-vs-try_-calls) for
 Address roles in this registry are **not mutually exclusive and are not restricted to external accounts**:
 
 - **An address may be both an admin and a registered watcher.** This is permitted and unvalidated by design. The watcher role grants no privileges beyond "is an authorized watcher", so an admin that is also a watcher gains nothing it could not already do.
+- **The guardian is a low-privilege role.** A guardian may only `pause`; it cannot `unpause`, mutate admins or watchers, or perform any other privileged operation. An address may be both an admin and the guardian.
 - **Contract addresses are accepted** anywhere an `Address` is taken (admins and watchers alike). Soroban treats account and contract addresses uniformly, and the registry does not distinguish them.
 
 Callers that need external-account-only or disjoint-role guarantees must enforce that off-chain before calling `initialize`, `add_admin`, or `register_watcher`.
 
 ---
 
+## Timelock delay
+
+The timelock delay can be **raised** directly with `set_timelock_delay(admin, delay)`, which is raise-only: it returns `TimelockRequired` for any value below the current delay. To **lower** the delay — including disabling it with `0` — queue `AdminAction::SetTimelockDelay(new_delay)` via `propose_admin_action` and let it mature before `execute_admin_action`. `propose_admin_action` accepts lower and zero delays (subject to `MAX_TIMELOCK_DELAY`); the timelock itself protects the reduction, so a compromised admin cannot silently shorten the delay.
+
+---
+
 ## Pause behavior
 
+The contract can be paused by an admin **or the guardian**, which prevents all state-mutating operations (`add_admin`, `remove_admin`, `register_watcher`, `remove_watcher`, `replace_watcher`, `clear_all_watchers`, `accept_admin_transfer`, etc.). Only an admin may `unpause`. Pausing only affects mutations — read-only queries like `is_watcher_authorized`, `get_watchers`, and `get_admins` continue to work.
 The contract can be paused by an admin, which prevents all state-mutating operations (`add_admin`, `remove_admin`, `register_watcher`, `remove_watcher`, `replace_watcher`, `clear_all_watchers`, `accept_admin_transfer`, `set_watcher_scope`, `migrate`, etc.). Pausing only affects mutations — read-only queries like `is_watcher_authorized`, `get_watchers`, `get_admins`, and `get_schema_version` continue to work.
 
 `accept_admin_transfer` is blocked while paused, so pausing during a suspected compromise stops a pending admin takeover from completing. `cancel_admin_transfer` is deliberately **not** blocked by the pause flag, so admins can always discard a pending proposal while the registry is paused.
@@ -965,7 +1037,7 @@ Each watcher can carry an optional **scope**: a list of target contract addresse
 
 Gating is optional and off by default — if no watcher registry address is configured on `AlertRegistry`, these reads are unrestricted. See `docs/alert-registry.md`'s [`set_watcher_registry`](./alert-registry.md#set_watcher_registry) for the consumer-side configuration.
 
-Because gating is a live cross-contract read, removing a watcher here (via `remove_watcher`, `replace_watcher`, or `clear_all_watchers`) takes effect immediately for any `AlertRegistry` deployment that has gating enabled — there is no caching or delay on the consumer side.
+Because gating is a live cross-contract read, removing a watcher here (via `remove_watcher`, `replace_watcher`, or `clear_all_watchers` with a `keep` set that excludes it) takes effect immediately for any `AlertRegistry` deployment that has gating enabled — there is no caching or delay on the consumer side.
 
 ---
 
@@ -981,6 +1053,7 @@ All state is stored in **instance storage**, addressed by the `DataKey` enum plu
 | `DataKey::TimelockDelay` | `u32` | Timelock delay in ledgers (`0`/absent = disabled) |
 | `DataKey::PendingAction` | `PendingAction` | Queued timelocked admin action |
 | `DataKey::Paused` | `bool` | Pause flag |
+| `DataKey::Guardian` | `Address` | Optional guardian allowed to `pause` (not `unpause`) |
 | `DataKey::SchemaVersion` | `u32` | Storage schema version (`SCHEMAV`), set by the constructor and advanced by `migrate` |
 | `"W_CNT"` | `u32` | Cached watcher count |
 
