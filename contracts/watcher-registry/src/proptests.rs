@@ -239,5 +239,150 @@ proptest! {
             prop_assert_eq!(count, watchers.len());
             prop_assert!(!client.get_admins().is_empty());
         }
+    fn prop_watcher_info_label_within_cap_accepted(
+        label in "[a-zA-Z0-9_]{0,64}"
+    ) {
+        let (env, admin, client) = create_env_and_client();
+        let watcher = Address::generate(&env);
+        client.register_watcher(&admin, &watcher);
+
+        let label = soroban_sdk::String::from_str(&env, &label);
+        client.set_watcher_info(&admin, &watcher, &label);
+
+        let info = client.get_watcher_info(&watcher);
+        prop_assert_eq!(info.label, label);
+    }
+
+    #[test]
+    fn prop_watcher_info_label_over_cap_rejected(
+        extra in 1..64usize
+    ) {
+        let (env, admin, client) = create_env_and_client();
+        let watcher = Address::generate(&env);
+        client.register_watcher(&admin, &watcher);
+
+        let len = 64 + extra;
+        let mut buf = std::string::String::new();
+        for _ in 0..len {
+            buf.push('a');
+        }
+        let label = soroban_sdk::String::from_str(&env, &buf);
+
+        let result = client.try_set_watcher_info(&admin, &watcher, &label);
+        prop_assert_eq!(result, Err(Ok(ContractError::LabelTooLong)));
+    }
+
+    #[test]
+    fn prop_watcher_operator_within_cap_accepted(
+        operator in "[a-zA-Z0-9_]{0,64}"
+    ) {
+        let (env, admin, client) = create_env_and_client();
+        let watcher = Address::generate(&env);
+        client.register_watcher(&admin, &watcher);
+
+        let label = soroban_sdk::String::from_str(&env, "label");
+        let operator = soroban_sdk::String::from_str(&env, &operator);
+        client.set_watcher_info(&admin, &watcher, &label, &operator);
+
+        let info = client.get_watcher_info(&watcher);
+        prop_assert_eq!(info.operator, operator);
+    }
+
+    #[test]
+    fn prop_watcher_operator_over_cap_rejected(
+        extra in 1..64usize
+    ) {
+        let (env, admin, client) = create_env_and_client();
+        let watcher = Address::generate(&env);
+        client.register_watcher(&admin, &watcher);
+
+        let label = soroban_sdk::String::from_str(&env, "label");
+        let len = 64 + extra;
+        let mut buf = std::string::String::new();
+        for _ in 0..len {
+            buf.push('a');
+        }
+        let operator = soroban_sdk::String::from_str(&env, &buf);
+
+        let result = client.try_set_watcher_info(&admin, &watcher, &label, &operator);
+        prop_assert_eq!(result, Err(Ok(ContractError::OperatorTooLong)));
+    }
+
+    #[test]
+    fn prop_watcher_scope_within_cap_accepted(
+        scope in prop::collection::vec(any::<u32>(), 0..32)
+    ) {
+        let (env, admin, client) = create_env_and_client();
+        let watcher = Address::generate(&env);
+        client.register_watcher(&admin, &watcher);
+
+        let mut scopes = soroban_sdk::Vec::new(&env);
+        for s in scope.iter() {
+            scopes.push_back(*s);
+        }
+        client.set_watcher_scope(&admin, &watcher, &scopes);
+
+        let stored = client.get_watcher_scope(&watcher);
+        prop_assert_eq!(stored, scopes);
+    }
+
+    #[test]
+    fn prop_watcher_scope_over_cap_rejected(
+        extra in 1..32usize
+    ) {
+        let (env, admin, client) = create_env_and_client();
+        let watcher = Address::generate(&env);
+        client.register_watcher(&admin, &watcher);
+
+        let len = 32 + extra;
+        let mut scopes = soroban_sdk::Vec::new(&env);
+        for i in 0..len {
+            scopes.push_back(i as u32);
+        }
+
+        let result = client.try_set_watcher_scope(&admin, &watcher, &scopes);
+        prop_assert_eq!(result, Err(Ok(ContractError::ScopeTooLong)));
+    }
+
+    #[test]
+    fn prop_setters_reject_unregistered_watcher(
+        label in "[a-zA-Z0-9_]{0,64}",
+        scope in prop::collection::vec(any::<u32>(), 0..32)
+    ) {
+        let (env, admin, client) = create_env_and_client();
+        let watcher = Address::generate(&env);
+
+        let label = soroban_sdk::String::from_str(&env, &label);
+        let info_result = client.try_set_watcher_info(&admin, &watcher, &label);
+        prop_assert_eq!(info_result, Err(Ok(ContractError::WatcherNotFound)));
+
+        let mut scopes = soroban_sdk::Vec::new(&env);
+        for s in scope.iter() {
+            scopes.push_back(*s);
+        }
+        let scope_result = client.try_set_watcher_scope(&admin, &watcher, &scopes);
+        prop_assert_eq!(scope_result, Err(Ok(ContractError::WatcherNotFound)));
+    }
+
+    #[test]
+    fn prop_setters_fail_while_paused(
+        label in "[a-zA-Z0-9_]{0,64}",
+        scope in prop::collection::vec(any::<u32>(), 0..32)
+    ) {
+        let (env, admin, client) = create_env_and_client();
+        let watcher = Address::generate(&env);
+        client.register_watcher(&admin, &watcher);
+        client.pause(&admin);
+
+        let label = soroban_sdk::String::from_str(&env, &label);
+        let info_result = client.try_set_watcher_info(&admin, &watcher, &label);
+        prop_assert_eq!(info_result, Err(Ok(ContractError::ContractPaused)));
+
+        let mut scopes = soroban_sdk::Vec::new(&env);
+        for s in scope.iter() {
+            scopes.push_back(*s);
+        }
+        let scope_result = client.try_set_watcher_scope(&admin, &watcher, &scopes);
+        prop_assert_eq!(scope_result, Err(Ok(ContractError::ContractPaused)));
     }
 }

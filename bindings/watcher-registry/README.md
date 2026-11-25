@@ -99,6 +99,7 @@ class. The method signatures mirror the Soroban contract interface exactly.
   addresses passed in `keep`. The resulting watcher set must still contain at
   least `MIN_WATCHERS` members, otherwise the call fails with
   `BelowMinWatchers`.
+| `get_configuration()` | — | Return a one-shot snapshot of the registry configuration (admins, paused state, timelock delay, pending action, pending admin transfer, watcher count) |
 
 ## Network addresses
 

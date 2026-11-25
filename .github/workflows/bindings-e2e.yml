@@ -93,6 +93,7 @@ jobs:
           curl -s "http://localhost:8000/friendbot?addr=${ADMIN_ADDR}" > /dev/null
 
       - name: Deploy alert registry to local quickstart
+        id: deploy
         env:
           NETWORK: local
           RPC_URL: http://localhost:8000/soroban-rpc
@@ -117,8 +118,11 @@ jobs:
         working-directory: bindings/alert-registry
         env:
           SOROBAN_RPC_URL: http://localhost:8000/soroban-rpc
-          NETWORKS_TESTNET_RPC_URL: http://localhost:8000/soroban-rpc
+          SOROBAN_CONTRACT_ID: ${{ steps.deploy.outputs.alert_id }}
         run: |
+          # Fail rather than let the suite skip silently (same gate as e2e.test.ts).
+          [[ "$SOROBAN_CONTRACT_ID" =~ ^C[A-Z2-7]{55}$ ]] || { echo "bad contract id: '$SOROBAN_CONTRACT_ID'"; exit 1; }
+          export SOROBAN_SECRET_KEY="$(stellar keys show deployer)"
           npm test
 
       - name: Tear down quickstart

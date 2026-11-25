@@ -492,6 +492,231 @@ fn test_regression_set_guardian_requires_admin() {
     let res = client.try_set_guardian(&not_admin, &Some(guardian));
     assert_eq!(res.unwrap_err().unwrap(), ContractError::Unauthorized);
     assert!(client.get_guardian().is_none());
+/// Regression test for #593: `set_watcher_info` must reject unregistered
+/// watchers, labels/operators exceeding the caps, and calls while paused.
+#[test]
+fn test_regression_set_watcher_info_validation() {
+    let (env, admin, client) = setup();
+    let watcher = Address::generate(&env);
+    let unregistered = Address::generate(&env);
+
+    let info = WatcherInfo {
+        label: String::from_str(&env, "keeper-east"),
+        operator: String::from_str(&env, "Acme Monitoring"),
+    };
+
+    // Unregistered watcher is rejected.
+    assert_eq!(
+        client
+            .try_set_watcher_info(&admin, &unregistered, &Some(info.clone()))
+            .unwrap_err()
+            .unwrap(),
+        ContractError::WatcherNotFound
+    );
+
+    client.register_watcher(&admin, &watcher);
+
+    // Label at the cap is accepted; one past the cap is rejected.
+    let max_label = String::from_str(&env, &"a".repeat(MAX_WATCHER_LABEL_LEN as usize));
+    let too_long_label = String::from_str(&env, &"a".repeat(MAX_WATCHER_LABEL_LEN as usize + 1));
+    assert_eq!(
+        client
+            .try_set_watcher_info(
+                &admin,
+                &watcher,
+                &Some(WatcherInfo {
+                    label: max_label,
+                    operator: String::from_str(&env, "op"),
+                }),
+            )
+            .unwrap(),
+        Ok(())
+    );
+    assert_eq!(
+        client
+            .try_set_watcher_info(
+                &admin,
+                &watcher,
+                &Some(WatcherInfo {
+                    label: too_long_label,
+                    operator: String::from_str(&env, "op"),
+                }),
+            )
+            .unwrap_err()
+            .unwrap(),
+        ContractError::LabelTooLong
+    );
+
+    // Operator at the cap is accepted; one past the cap is rejected.
+    let max_operator = String::from_str(&env, &"b".repeat(MAX_WATCHER_OPERATOR_LEN as usize));
+    let too_long_operator =
+        String::from_str(&env, &"b".repeat(MAX_WATCHER_OPERATOR_LEN as usize + 1));
+    assert_eq!(
+        client
+            .try_set_watcher_info(
+                &admin,
+                &watcher,
+                &Some(WatcherInfo {
+                    label: String::from_str(&env, "lbl"),
+                    operator: max_operator,
+                }),
+            )
+            .unwrap(),
+        Ok(())
+    );
+    assert_eq!(
+        client
+            .try_set_watcher_info(
+                &admin,
+                &watcher,
+                &Some(WatcherInfo {
+                    label: String::from_str(&env, "lbl"),
+                    operator: too_long_operator,
+                }),
+            )
+            .unwrap_err()
+            .unwrap(),
+        ContractError::OperatorTooLong
+    );
+
+    // Paused contract rejects the setter.
+    client.pause(&admin);
+    assert_eq!(
+        client
+            .try_set_watcher_info(&admin, &watcher, &Some(info))
+            .unwrap_err()
+            .unwrap(),
+        ContractError::ContractPaused
+    );
+}
+
+/// Regression test for #593: `set_watcher_scope` must reject unregistered
+/// watchers, scope vectors exceeding the cap, and calls while paused.
+#[test]
+fn test_regression_set_watcher_scope_validation() {
+    let (env, admin, client) = setup();
+    let watcher = Address::generate(&env);
+    let unregistered = Address::generate(&env);
+
+    let scope = soroban_sdk::vec![&env, Address::generate(&env)];
+
+    // Unregistered watcher is rejected.
+    assert_eq!(
+        client
+            .try_set_watcher_scope(&admin, &unregistered, &scope)
+            .unwrap_err()
+            .unwrap(),
+        ContractError::WatcherNotFound
+    );
+
+    client.register_watcher(&admin, &watcher);
+
+    // Scope at the cap is accepted; one past the cap is rejected.
+    let mut max_scope: Vec<Address> = soroban_sdk::vec![&env];
+    for _ in 0..MAX_WATCHER_SCOPE_LEN {
+        max_scope.push_back(Address::generate(&env));
+    }
+    assert_eq!(
+        client
+            .try_set_watcher_scope(&admin, &watcher, &max_scope)
+            .unwrap(),
+        Ok(())
+    );
+
+    let mut too_long_scope = max_scope.clone();
+    too_long_scope.push_back(Address::generate(&env));
+    assert_eq!(
+        client
+            .try_set_watcher_scope(&admin, &watcher, &too_long_scope)
+            .unwrap_err()
+            .unwrap(),
+        ContractError::ScopeTooLong
+    );
+
+    // Paused contract rejects the setter.
+    client.pause(&admin);
+    assert_eq!(
+        client
+            .try_set_watcher_scope(&admin, &watcher, &scope)
+            .unwrap_err()
+            .unwrap(),
+        ContractError::ContractPaused
+    );
+}
+
+/// Regression test for #593: watcher info and scope live in persistent
+/// storage, survive across invocations, and have their TTL extended on write.
+#[test]
+fn test_regression_watcher_metadata_persistent_storage_and_ttl() {
+    use soroban_sdk::testutils::storage::Persistent as _;
+    use soroban_sdk::testutils::Ledger as _;
+
+    let (env, admin, client) = setup();
+    let watcher = Address::generate(&env);
+    let target = Address::generate(&env);
+    client.register_watcher(&admin, &watcher);
+
+    let info = WatcherInfo {
+        label: String::from_str(&env, "keeper-east"),
+        operator: String::from_str(&env, "Acme Monitoring"),
+    };
+    client.set_watcher_info(&admin, &watcher, &Some(info.clone()));
+    client.set_watcher_scope(&admin, &watcher, &soroban_sdk::vec![&env, target.clone()]);
+
+    // Advance the ledger so the TTL is non-trivial, then re-write to extend it.
+    env.ledger().with_mut(|li| li.sequence_number += 10);
+    client.set_watcher_info(&admin, &watcher, &Some(info.clone()));
+
+    let contract_id = client.address.clone();
+    let info_key = DataKey::WatcherInfo(watcher.clone());
+    let scope_key = DataKey::WatcherScope(watcher.clone());
+    let info_ttl = env.as_contract(&contract_id, || env.storage().persistent().get_ttl(&info_key));
+    let scope_ttl =
+        env.as_contract(&contract_id, || env.storage().persistent().get_ttl(&scope_key));
+    assert!(info_ttl > 0, "WatcherInfo TTL must be extended on write");
+    assert!(scope_ttl > 0, "WatcherScope TTL must be extended on write");
+
+    // Values survive across invocations.
+    assert_eq!(client.get_watcher_info(&watcher), Some(info));
+    assert_eq!(
+        client.get_watcher_scope(&watcher),
+        soroban_sdk::vec![&env, target.clone()]
+    );
+    assert!(client.is_watcher_authorized_for(&watcher, &target));
+}
+
+/// Test for #602: `get_configuration` returns a snapshot matching the
+/// individual getters.
+#[test]
+fn test_get_configuration_matches_individual_getters() {
+    let (env, admin, client) = setup();
+    let watcher = Address::generate(&env);
+    client.register_watcher(&admin, &watcher);
+    client.set_timelock_delay(&admin, &42);
+
+    let config = client.get_configuration();
+    assert_eq!(config.admins, client.get_admins());
+    assert_eq!(config.paused, client.is_paused());
+    assert_eq!(config.timelock_delay, client.get_timelock_delay());
+    assert_eq!(config.pending_action, client.get_pending_action());
+    assert_eq!(
+        config.pending_admin_transfer,
+        client.get_pending_admin_transfer()
+    );
+    assert_eq!(config.watcher_count, client.get_watcher_count());
+
+    // Reflects state changes.
+    client.pause(&admin);
+    let new_admin = Address::generate(&env);
+    client.propose_admin_transfer(&admin, &new_admin);
+    let config = client.get_configuration();
+    assert!(config.paused);
+    assert_eq!(
+        config.pending_admin_transfer,
+        client.get_pending_admin_transfer()
+    );
+    assert!(config.pending_admin_transfer.is_some());
+}
 /// Regression test for #403: `remove_admin` on an address that is not an
 /// admin must return `ContractError::AdminNotFound` and must not rewrite the
 /// admin set or emit an `admin.remove` event.
@@ -583,4 +808,105 @@ fn test_regression_pending_action_cancelled_on_proposer_removal() {
     let res = client.try_execute_admin_action(&admin);
     assert_eq!(res.unwrap_err().unwrap(), ContractError::NoPendingAction);
     assert!(!client.is_admin(&third_admin));
+}
+
+/// Regression test for #597: while the registry is paused, a pending admin
+/// transfer cannot be accepted, but it can still be cancelled.
+#[test]
+fn test_regression_accept_admin_transfer_blocked_while_paused() {
+    let (env, admin, client) = setup();
+    let new_admin = Address::generate(&env);
+
+    client.propose_admin_transfer(&admin, &new_admin);
+    client.pause(&admin);
+
+    let res = client.try_accept_admin_transfer(&new_admin);
+    assert_eq!(
+        res.unwrap_err().unwrap(),
+        ContractError::Paused,
+        "Accepting an admin transfer must be blocked while paused"
+    );
+    assert!(!client.is_admin(&new_admin));
+
+    // Cancelling remains allowed while paused so a suspected takeover can be
+    // aborted without unpausing.
+    assert_eq!(
+        client.try_cancel_admin_transfer(&admin).unwrap(),
+        Ok(())
+    );
+    assert_eq!(
+        client.try_accept_admin_transfer(&new_admin).unwrap_err().unwrap(),
+        ContractError::NoPendingTransfer
+    );
+}
+
+/// Test for #600: `set_watcher_scope` deduplicates entries and rejects the
+/// registry's own address and the watcher's own address.
+#[test]
+fn test_set_watcher_scope_validates_targets() {
+    let (env, admin, client) = setup();
+    let watcher = Address::generate(&env);
+    let target_a = Address::generate(&env);
+    let target_b = Address::generate(&env);
+    client.register_watcher(&admin, &watcher);
+
+    // Duplicates are collapsed while preserving order.
+    let scope = soroban_sdk::vec![
+        &env,
+        target_a.clone(),
+        target_b.clone(),
+        target_a.clone(),
+        target_b.clone(),
+    ];
+    client.set_watcher_scope(&admin, &watcher, &scope);
+    let stored = client.get_watcher_scope(&watcher);
+    assert_eq!(stored.len(), 2);
+    assert_eq!(stored.get(0).unwrap(), target_a);
+    assert_eq!(stored.get(1).unwrap(), target_b);
+
+    // The registry's own address is not a valid target.
+    let registry_id = client.address.clone();
+    let res = client.try_set_watcher_scope(
+        &admin,
+        &watcher,
+        &soroban_sdk::vec![&env, registry_id],
+    );
+    assert_eq!(res.unwrap_err().unwrap(), ContractError::InvalidScopeTarget);
+
+    // The watcher itself is not a valid target.
+    let res = client.try_set_watcher_scope(
+        &admin,
+        &watcher,
+        &soroban_sdk::vec![&env, watcher.clone()],
+    );
+    assert_eq!(res.unwrap_err().unwrap(), ContractError::InvalidScopeTarget);
+
+    // The previously stored scope is unchanged after rejected updates.
+    assert_eq!(client.get_watcher_scope(&watcher), stored);
+}
+
+/// Test for #603: the constructor records the current schema version and
+/// `migrate` validates its arguments.
+#[test]
+fn test_schema_version_and_migrate_validation() {
+    let (_env, _admin, client) = setup();
+
+    assert_eq!(client.get_schema_version(), CURRENT_SCHEMA_VERSION);
+
+    // `from` must match the stored schema version.
+    let res = client.try_migrate(&(CURRENT_SCHEMA_VERSION + 1), &CURRENT_SCHEMA_VERSION);
+    assert_eq!(res.unwrap_err().unwrap(), ContractError::SchemaMismatch);
+
+    // `to` must be strictly greater than `from`.
+    let res = client.try_migrate(&CURRENT_SCHEMA_VERSION, &CURRENT_SCHEMA_VERSION);
+    assert_eq!(res.unwrap_err().unwrap(), ContractError::InvalidSchemaVersion);
+
+    // A valid migration advances the stored version.
+    assert_eq!(
+        client
+            .try_migrate(&CURRENT_SCHEMA_VERSION, &(CURRENT_SCHEMA_VERSION + 1))
+            .unwrap(),
+        Ok(())
+    );
+    assert_eq!(client.get_schema_version(), CURRENT_SCHEMA_VERSION + 1);
 }

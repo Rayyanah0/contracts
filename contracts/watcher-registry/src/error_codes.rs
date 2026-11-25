@@ -46,5 +46,11 @@ mod tests {
         // for an invalid kept set. Existing discriminants are unchanged.
         assert_eq!(ContractError::BelowMinWatchers as u32, 19);
         assert_eq!(ContractError::InvalidKeptSet as u32, 20);
+    fn test_length_limit_error_codes_are_stable() {
+        // GH #593: length-limit error variants for watcher metadata and scopes.
+        // These discriminants are part of the public ABI; pin them so they stay stable.
+        assert_eq!(ContractError::LabelTooLong as u32, 17);
+        assert_eq!(ContractError::OperatorTooLong as u32, 18);
+        assert_eq!(ContractError::ScopeTooLong as u32, 19);
     }
 }

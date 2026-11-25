@@ -105,5 +105,41 @@ See [bindings/watcher-registry](../../bindings/watcher-registry/README.md).
 
 See [docs/watcher-registry.md](../../docs/watcher-registry.md).
 
+### `get_configuration`
+
+Returns the full registry configuration in a single call, so dashboards do not
+need to invoke `get_admins`, `is_paused`, `get_timelock_delay`,
+`get_pending_action`, `get_pending_admin_transfer` and `get_watcher_count`
+separately:
+
+```rust
+pub struct WatcherRegistryConfiguration {
+    pub admins: Vec<Address>,
+    pub paused: bool,
+    pub timelock_delay: u64,
+    pub pending_action: Option<PendingAction>,
+    pub pending_admin_transfer: Option<Address>,
+    pub watcher_count: u32,
+}
+```
+
+```bash
+stellar contract invoke \
+  --id <CONTRACT_ID> --network testnet \
+  -- get_configuration
+```
+
+### Watcher metadata and scopes
+
+`set_watcher_info` and `set_watcher_scope` store per-watcher data in
+**persistent** storage with TTL extension, so metadata does not bloat instance
+storage or the cost of every other call. Both setters:
+
+- require the contract to be unpaused (they fail with `ContractPaused` otherwise);
+- reject addresses that are not registered watchers (`NotAuthorized`);
+- cap `label` and `operator` at `MAX_WATCHER_STRING_LEN` bytes and the scope
+  vector at `MAX_WATCHER_SCOPE_LEN` entries (`InvalidInput` when exceeded).
+=======
+
 ## License
 MIT

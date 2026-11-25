@@ -30,6 +30,11 @@ rather than assuming the current shape. Events not yet marked `(versioned)`
 below predate this policy and do not carry the marker; they may be migrated
 to it as their shapes change.
 
+`admin.limit`, `admin.timelock` and `admin.watchreg` were migrated to the
+versioned scheme in #604, which also added the previous value (`old`) to each
+payload alongside the new one. Their v1 shapes (unversioned, new value only)
+remain documented so indexers can decode historical events.
+
 ---
 
 ## AlertRegistry
@@ -183,6 +188,27 @@ Emitted when an alert is removed by its owner or by an admin.
 | Data | `(id: u64, caller: Address)` |
 
 **Status:** ✅ implemented (`remove_alert`, `remove_alert_by_admin`)
+
+---
+
+### `alert.rm_all`
+
+Emitted by `remove_all_alerts` when at least one index entry is processed in
+the pass. Each call removes up to a bounded number of the caller's alerts, so
+a caller with more alerts needs repeated calls. The event is emitted once per
+call, not once per removed alert.
+
+| Field | Value |
+|---|---|
+| Topic 0 | `Symbol("alert")` |
+| Topic 1 | `Symbol("rm_all")` |
+| Data | `(caller: Address, count: u32)` |
+
+> `count` is the number of entries processed in this pass, including dangling
+> IDs whose records had already expired. It is not necessarily the number of
+> alerts that were removed.
+
+**Status:** ✅ implemented (`remove_all_alerts`)
 
 ---
 
@@ -401,7 +427,7 @@ shape.
 
 ---
 
-### `admin.limit`
+### `admin.limit` (versioned)
 
 Emitted when an alert limit is changed.
 
@@ -409,17 +435,22 @@ Emitted when an alert limit is changed.
 |---|---|
 | Topic 0 | `Symbol("admin")` |
 | Topic 1 | `Symbol("limit")` |
-| Data | `(admin: Address, kind: Symbol("owner") \| Symbol("contract") \| Symbol("global"), limit: u32)` |
+| Data (v1) | `(admin: Address, kind: Symbol("owner") \| Symbol("contract") \| Symbol("global"), limit: u32)` |
+| Data (v2) | `(version: u32, admin: Address, kind: Symbol("owner") \| Symbol("contract") \| Symbol("global"), old: u32, new: u32)` |
 
 The `kind` value identifies whether the per-owner, per-contract, or global
-limit was changed.
+limit was changed. v2 (#604) adds the version marker and carries both the
+previous (`old`) and the new (`new`) limit, so an auditor can reconstruct the
+change without replaying every earlier event. `version` is `2`
+(`EVENT_SCHEMA_VERSION`) for every limit change emitted by the current
+contract code.
 
 **Status:** ✅ implemented (`set_per_owner_alert_limit`,
 `set_per_contract_alert_limit`, `set_global_alert_limit`)
 
 ---
 
-### `admin.watchreg`
+### `admin.watchreg` (versioned)
 
 Emitted when watcher-gating is enabled or disabled. A `None` registry means
 gating was disabled.
@@ -428,7 +459,14 @@ gating was disabled.
 |---|---|
 | Topic 0 | `Symbol("admin")` |
 | Topic 1 | `Symbol("watchreg")` |
-| Data | `(admin: Address, watcher_registry: Option<Address>)` |
+| Data (v1) | `(admin: Address, watcher_registry: Option<Address>)` |
+| Data (v2) | `(version: u32, admin: Address, old: Option<Address>, new: Option<Address>)` |
+
+v2 (#604) adds the version marker and carries both the previous (`old`) and
+the new (`new`) watcher registry, so an auditor can reconstruct the change
+without replaying every earlier event. `version` is `2`
+(`EVENT_SCHEMA_VERSION`) for every watcher-registry change emitted by the
+current contract code.
 
 **Status:** ✅ implemented (`set_watcher_registry`, `clear_watcher_registry`)
 
@@ -705,7 +743,7 @@ is accepted by the proposed admin.
 
 ---
 
-### `admin.timelock`
+### `admin.timelock` (versioned)
 
 Emitted when the timelock delay applied to sensitive admin actions is changed.
 
@@ -713,7 +751,14 @@ Emitted when the timelock delay applied to sensitive admin actions is changed.
 |---|---|
 | Topic 0 | `Symbol("admin")` |
 | Topic 1 | `Symbol("timelock")` |
-| Data | `(caller: Address, delay_ledgers: u32)` |
+| Data (v1) | `(caller: Address, delay_ledgers: u32)` |
+| Data (v2) | `(version: u32, caller: Address, old_delay_ledgers: u32, new_delay_ledgers: u32)` |
+
+v2 (#604) adds the version marker and carries both the previous
+(`old_delay_ledgers`) and the new (`new_delay_ledgers`) delay, so an auditor
+can reconstruct the change without replaying every earlier event. `version`
+is `2` (`EVENT_SCHEMA_VERSION`) for every timelock change emitted by the
+current contract code.
 
 **Status:** ✅ implemented (`set_timelock_delay`, `execute_admin_action`)
 
