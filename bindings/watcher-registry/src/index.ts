@@ -47,6 +47,31 @@ export interface NetworkConfig {
 
 export type NetworkName = "testnet" | "mainnet";
 
+// ── Configuration snapshot ────────────────────────────────────────────────────
+// Mirrors the on-chain `WatcherRegistryConfiguration` struct returned by
+// `get_configuration()`. Dashboards can fetch the full registry state in a
+// single call instead of invoking `get_admins`, `is_paused`,
+// `get_timelock_delay`, `get_pending_action`, `get_pending_admin_transfer`
+// and `get_watcher_count` separately.
+//
+// The generated `Client` exposes `get_configuration()` which resolves to this
+// shape (the generated XDR type is structurally compatible).
+
+export interface WatcherRegistryConfiguration {
+  /** Current admin addresses. */
+  admins: string[];
+  /** Whether the registry is paused. */
+  paused: boolean;
+  /** Timelock delay (in ledgers) applied to admin actions. */
+  timelockDelay: bigint;
+  /** Currently pending timelocked action, if any. */
+  pendingAction: unknown | null;
+  /** Currently pending admin transfer, if any. */
+  pendingAdminTransfer: unknown | null;
+  /** Number of registered watchers. */
+  watcherCount: number;
+}
+
 export const networks = {
   testnet: {
     contractId: "CCSHRYACRNVSLC5NP3V2DL6LGID57TQT2TJXVUVXBBZX6SED6N3F7X6J",

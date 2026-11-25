@@ -42,7 +42,7 @@ ALERT_ID=$(stellar contract deploy \
   --network "$NETWORK" \
   --rpc-url "$RPC_URL" \
   --network-passphrase "$NETWORK_PASSPHRASE" \
-  -- --admin "$ADMIN_ADDRESS"
+  -- --admin "$ADMIN_ADDRESS")
 echo "Alert Registry deployed: $ALERT_ID"
 
 echo "==> Deploying Watcher Registry..."
