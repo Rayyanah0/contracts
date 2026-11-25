@@ -73,6 +73,7 @@ class. The method signatures mirror the Soroban contract interface exactly.
 | `transfer_admin(admin, new_admin)` | `admin` | Replace the entire admin set |
 | `get_admins()` | — | Return all current admin addresses |
 | `get_admin()` | — | Return the primary admin address |
+| `get_configuration()` | — | Return a one-shot snapshot of the registry configuration (admins, paused state, timelock delay, pending action, pending admin transfer, watcher count) |
 
 ## Network addresses
 

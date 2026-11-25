@@ -58,6 +58,7 @@ describe("WatcherRegistry bindings", () => {
     expect(typeof client.is_paused).toBe("function");
     expect(typeof client.get_watcher_count).toBe("function");
     expect(typeof client.get_timelock_delay).toBe("function");
+    expect(typeof client.get_configuration).toBe("function");
   });
 
   it("exposes expected write methods on the Client prototype", () => {

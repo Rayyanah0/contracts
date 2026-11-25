@@ -345,6 +345,233 @@ fn test_are_watchers_authorized_batch_query() {
         client.are_watchers_authorized(&oversized).len() as u32,
         MAX_PAGE_SIZE
     );
+}
+
+/// Regression test for #593: `set_watcher_info` must reject unregistered
+/// watchers, labels/operators exceeding the caps, and calls while paused.
+#[test]
+fn test_regression_set_watcher_info_validation() {
+    let (env, admin, client) = setup();
+    let watcher = Address::generate(&env);
+    let unregistered = Address::generate(&env);
+
+    let info = WatcherInfo {
+        label: String::from_str(&env, "keeper-east"),
+        operator: String::from_str(&env, "Acme Monitoring"),
+    };
+
+    // Unregistered watcher is rejected.
+    assert_eq!(
+        client
+            .try_set_watcher_info(&admin, &unregistered, &Some(info.clone()))
+            .unwrap_err()
+            .unwrap(),
+        ContractError::WatcherNotFound
+    );
+
+    client.register_watcher(&admin, &watcher);
+
+    // Label at the cap is accepted; one past the cap is rejected.
+    let max_label = String::from_str(&env, &"a".repeat(MAX_WATCHER_LABEL_LEN as usize));
+    let too_long_label = String::from_str(&env, &"a".repeat(MAX_WATCHER_LABEL_LEN as usize + 1));
+    assert_eq!(
+        client
+            .try_set_watcher_info(
+                &admin,
+                &watcher,
+                &Some(WatcherInfo {
+                    label: max_label,
+                    operator: String::from_str(&env, "op"),
+                }),
+            )
+            .unwrap(),
+        Ok(())
+    );
+    assert_eq!(
+        client
+            .try_set_watcher_info(
+                &admin,
+                &watcher,
+                &Some(WatcherInfo {
+                    label: too_long_label,
+                    operator: String::from_str(&env, "op"),
+                }),
+            )
+            .unwrap_err()
+            .unwrap(),
+        ContractError::LabelTooLong
+    );
+
+    // Operator at the cap is accepted; one past the cap is rejected.
+    let max_operator = String::from_str(&env, &"b".repeat(MAX_WATCHER_OPERATOR_LEN as usize));
+    let too_long_operator =
+        String::from_str(&env, &"b".repeat(MAX_WATCHER_OPERATOR_LEN as usize + 1));
+    assert_eq!(
+        client
+            .try_set_watcher_info(
+                &admin,
+                &watcher,
+                &Some(WatcherInfo {
+                    label: String::from_str(&env, "lbl"),
+                    operator: max_operator,
+                }),
+            )
+            .unwrap(),
+        Ok(())
+    );
+    assert_eq!(
+        client
+            .try_set_watcher_info(
+                &admin,
+                &watcher,
+                &Some(WatcherInfo {
+                    label: String::from_str(&env, "lbl"),
+                    operator: too_long_operator,
+                }),
+            )
+            .unwrap_err()
+            .unwrap(),
+        ContractError::OperatorTooLong
+    );
+
+    // Paused contract rejects the setter.
+    client.pause(&admin);
+    assert_eq!(
+        client
+            .try_set_watcher_info(&admin, &watcher, &Some(info))
+            .unwrap_err()
+            .unwrap(),
+        ContractError::ContractPaused
+    );
+}
+
+/// Regression test for #593: `set_watcher_scope` must reject unregistered
+/// watchers, scope vectors exceeding the cap, and calls while paused.
+#[test]
+fn test_regression_set_watcher_scope_validation() {
+    let (env, admin, client) = setup();
+    let watcher = Address::generate(&env);
+    let unregistered = Address::generate(&env);
+
+    let scope = soroban_sdk::vec![&env, Address::generate(&env)];
+
+    // Unregistered watcher is rejected.
+    assert_eq!(
+        client
+            .try_set_watcher_scope(&admin, &unregistered, &scope)
+            .unwrap_err()
+            .unwrap(),
+        ContractError::WatcherNotFound
+    );
+
+    client.register_watcher(&admin, &watcher);
+
+    // Scope at the cap is accepted; one past the cap is rejected.
+    let mut max_scope: Vec<Address> = soroban_sdk::vec![&env];
+    for _ in 0..MAX_WATCHER_SCOPE_LEN {
+        max_scope.push_back(Address::generate(&env));
+    }
+    assert_eq!(
+        client
+            .try_set_watcher_scope(&admin, &watcher, &max_scope)
+            .unwrap(),
+        Ok(())
+    );
+
+    let mut too_long_scope = max_scope.clone();
+    too_long_scope.push_back(Address::generate(&env));
+    assert_eq!(
+        client
+            .try_set_watcher_scope(&admin, &watcher, &too_long_scope)
+            .unwrap_err()
+            .unwrap(),
+        ContractError::ScopeTooLong
+    );
+
+    // Paused contract rejects the setter.
+    client.pause(&admin);
+    assert_eq!(
+        client
+            .try_set_watcher_scope(&admin, &watcher, &scope)
+            .unwrap_err()
+            .unwrap(),
+        ContractError::ContractPaused
+    );
+}
+
+/// Regression test for #593: watcher info and scope live in persistent
+/// storage, survive across invocations, and have their TTL extended on write.
+#[test]
+fn test_regression_watcher_metadata_persistent_storage_and_ttl() {
+    use soroban_sdk::testutils::storage::Persistent as _;
+    use soroban_sdk::testutils::Ledger as _;
+
+    let (env, admin, client) = setup();
+    let watcher = Address::generate(&env);
+    let target = Address::generate(&env);
+    client.register_watcher(&admin, &watcher);
+
+    let info = WatcherInfo {
+        label: String::from_str(&env, "keeper-east"),
+        operator: String::from_str(&env, "Acme Monitoring"),
+    };
+    client.set_watcher_info(&admin, &watcher, &Some(info.clone()));
+    client.set_watcher_scope(&admin, &watcher, &soroban_sdk::vec![&env, target.clone()]);
+
+    // Advance the ledger so the TTL is non-trivial, then re-write to extend it.
+    env.ledger().with_mut(|li| li.sequence_number += 10);
+    client.set_watcher_info(&admin, &watcher, &Some(info.clone()));
+
+    let contract_id = client.address.clone();
+    let info_key = DataKey::WatcherInfo(watcher.clone());
+    let scope_key = DataKey::WatcherScope(watcher.clone());
+    let info_ttl = env.as_contract(&contract_id, || env.storage().persistent().get_ttl(&info_key));
+    let scope_ttl =
+        env.as_contract(&contract_id, || env.storage().persistent().get_ttl(&scope_key));
+    assert!(info_ttl > 0, "WatcherInfo TTL must be extended on write");
+    assert!(scope_ttl > 0, "WatcherScope TTL must be extended on write");
+
+    // Values survive across invocations.
+    assert_eq!(client.get_watcher_info(&watcher), Some(info));
+    assert_eq!(
+        client.get_watcher_scope(&watcher),
+        soroban_sdk::vec![&env, target.clone()]
+    );
+    assert!(client.is_watcher_authorized_for(&watcher, &target));
+}
+
+/// Test for #602: `get_configuration` returns a snapshot matching the
+/// individual getters.
+#[test]
+fn test_get_configuration_matches_individual_getters() {
+    let (env, admin, client) = setup();
+    let watcher = Address::generate(&env);
+    client.register_watcher(&admin, &watcher);
+    client.set_timelock_delay(&admin, &42);
+
+    let config = client.get_configuration();
+    assert_eq!(config.admins, client.get_admins());
+    assert_eq!(config.paused, client.is_paused());
+    assert_eq!(config.timelock_delay, client.get_timelock_delay());
+    assert_eq!(config.pending_action, client.get_pending_action());
+    assert_eq!(
+        config.pending_admin_transfer,
+        client.get_pending_admin_transfer()
+    );
+    assert_eq!(config.watcher_count, client.get_watcher_count());
+
+    // Reflects state changes.
+    client.pause(&admin);
+    let new_admin = Address::generate(&env);
+    client.propose_admin_transfer(&admin, &new_admin);
+    let config = client.get_configuration();
+    assert!(config.paused);
+    assert_eq!(
+        config.pending_admin_transfer,
+        client.get_pending_admin_transfer()
+    );
+    assert!(config.pending_admin_transfer.is_some());
+}
 /// Regression test for #403: `remove_admin` on an address that is not an
 /// admin must return `ContractError::AdminNotFound` and must not rewrite the
 /// admin set or emit an `admin.remove` event.
