@@ -9,6 +9,7 @@ use crate::{AdminAction, ContractError, WatcherRegistry, WatcherRegistryClient};
 use proptest::prelude::*;
 use proptest::test_runner::TestCaseError;
 use soroban_sdk::{testutils::Address as _, Address, Env};
+use soroban_sdk::{testutils::Address as _, Address, Env, Vec as SorobanVec};
 
 fn create_env_and_client() -> (Env, Address, WatcherRegistryClient<'static>) {
     let env = Env::default();
@@ -24,8 +25,12 @@ pub enum WatcherAction {
     RegisterWatcher(usize),
     RemoveWatcher(usize),
     ReplaceWatcher { old_idx: usize, new_idx: usize },
-    ClearAll,
+    /// Clear all watchers except the ones kept (new `clear_all_watchers` semantics).
+    ClearAllKeeping(Vec<usize>),
     ClearBatch(Vec<usize>),
+    SetScope(usize),
+    Pause,
+    Unpause,
 }
 
 fn watcher_address(env: &Env, idx: usize) -> Address {
@@ -41,6 +46,11 @@ prop_compose! {
     fn arb_watcher_action()(action in prop_oneof![
         (0..10usize).prop_map(WatcherAction::RegisterWatcher),
         (0..10usize).prop_map(WatcherAction::RemoveWatcher),
+        (0..10usize).prop_map(WatcherAction::SetScope),
+        prop::collection::vec(0..10usize, 0..4).prop_map(WatcherAction::ClearAllKeeping),
+        prop::collection::vec(0..10usize, 0..4).prop_map(WatcherAction::ClearBatch),
+        Just(WatcherAction::Pause),
+        Just(WatcherAction::Unpause),
     ]) -> WatcherAction {
         action
     }
@@ -127,6 +137,316 @@ proptest! {
 
         // No duplicates should exist
         prop_assert_eq!(watchers.len() as usize, unique.len());
+    }
+
+    #[test]
+    fn prop_are_watchers_authorized_matches_input_length(
+        n in 0..40usize
+    ) {
+        let (env, admin, client) = create_env_and_client();
+        let watcher = Address::generate(&env);
+        let _ = client.register_watcher(&admin, &watcher);
+
+        let mut candidates = SorobanVec::new(&env);
+        for _ in 0..n {
+            candidates.push_back(Address::generate(&env));
+        }
+
+        let result = client.try_are_watchers_authorized(&candidates);
+        match result {
+            Ok(Ok(authorized)) => {
+                // Successful results must be aligned with the input length.
+                prop_assert_eq!(authorized.len() as usize, n);
+            }
+            Ok(Err(err)) => {
+                // Oversized batches must surface an explicit error rather than
+                // silently truncating the result vector.
+                prop_assert_eq!(err, ContractError::PageSizeExceeded);
+            }
+            Err(_) => {
+                // Host-level failure is acceptable only for oversized input.
+                prop_assert!(n > 0);
+            }
+        }
+    }
+
+    #[test]
+    fn prop_replace_watcher_preserves_scope_and_metadata(
+        scoped in any::<bool>(),
+        metadata in prop::option::of(0u32..1000u32),
+    ) {
+        let (env, admin, client) = create_env_and_client();
+        let old = Address::generate(&env);
+        let new = Address::generate(&env);
+
+        let _ = client.register_watcher(&admin, &old);
+
+        let scope = if scoped {
+            Some(SorobanVec::from_array(&env, [Address::generate(&env)]))
+        } else {
+            None
+        };
+        let _ = client.set_watcher_scope(&admin, &old, &scope);
+
+        let meta = metadata.map(|m| m as u64);
+        let _ = client.set_watcher_metadata(&admin, &old, &meta);
+
+        let _ = client.replace_watcher(&admin, &old, &new);
+
+        // Old address must no longer be registered.
+        prop_assert!(!client.is_watcher(&old));
+        // New address must be registered.
+        prop_assert!(client.is_watcher(&new));
+
+        // Scope and metadata must carry over to the new address.
+        prop_assert_eq!(client.get_watcher_scope(&new), scope);
+        prop_assert_eq!(client.get_watcher_metadata(&new), meta);
+    fn prop_removal_purges_metadata_and_scope(
+        actions in prop::collection::vec(arb_watcher_action(), 1..20)
+    ) {
+        let (env, admin, client) = create_env_and_client();
+        let mut registered: BTreeSet<Address> = BTreeSet::new();
+
+        for action in actions {
+            match action {
+                WatcherAction::RegisterWatcher(idx) => {
+                    let watcher = watcher_address(&env, idx);
+                    let _ = client.register_watcher(&admin, &watcher);
+                    registered.insert(watcher);
+                }
+                WatcherAction::SetScope(idx) => {
+                    if let Some(watcher) = registered.iter().nth(idx).cloned() {
+                        let _ = client.set_watcher_scope(&admin, &watcher, &1u32);
+                    }
+                }
+                WatcherAction::RemoveWatcher(idx) => {
+                    if let Some(watcher) = registered.iter().nth(idx).cloned() {
+                        let _ = client.remove_watcher(&admin, &watcher);
+                        registered.remove(&watcher);
+                        // Metadata and scope must be purged on removal.
+                        prop_assert!(client.get_watcher_info(&watcher).is_none());
+                        prop_assert!(client.get_watcher_scope(&watcher).is_none());
+                    }
+                }
+                WatcherAction::ClearBatch(indices) => {
+                    let mut to_clear = SorobanVec::new(&env);
+                    for idx in indices {
+                        if let Some(watcher) = registered.iter().nth(idx).cloned() {
+                            to_clear.push_back(watcher.clone());
+                            registered.remove(&watcher);
+                        }
+                    }
+                    let _ = client.clear_watchers_batch(&admin, &to_clear);
+                    for watcher in to_clear.iter() {
+                        prop_assert!(client.get_watcher_info(&watcher).is_none());
+                        prop_assert!(client.get_watcher_scope(&watcher).is_none());
+                    }
+                }
+                WatcherAction::ClearAllKeeping(indices) => {
+                    let mut keep = SorobanVec::new(&env);
+                    for idx in indices {
+                        if let Some(watcher) = registered.iter().nth(idx).cloned() {
+                            keep.push_back(watcher);
+                        }
+                    }
+                    let _ = client.clear_all_watchers(&admin, &keep);
+                    let kept: BTreeSet<Address> = keep.iter().collect();
+                    for watcher in registered.iter() {
+                        if !kept.contains(watcher) {
+                            prop_assert!(client.get_watcher_info(watcher).is_none());
+                            prop_assert!(client.get_watcher_scope(watcher).is_none());
+                        }
+                    }
+                    registered = kept;
+                }
+                _ => {}
+            }
+        }
+
+        // Re-registering a removed watcher must start unscoped.
+        for watcher in registered.iter() {
+            let _ = client.remove_watcher(&admin, watcher);
+            prop_assert!(client.get_watcher_scope(watcher).is_none());
+            let _ = client.register_watcher(&admin, watcher);
+            prop_assert!(client.get_watcher_scope(watcher).is_none());
+        }
+    }
+
+    #[test]
+    fn prop_guardian_pause_keeps_state_consistent(
+        actions in prop::collection::vec(arb_watcher_action(), 1..20)
+    ) {
+        let (env, admin, client) = create_env_and_client();
+        let guardian = Address::generate(&env);
+        let _ = client.set_guardian(&admin, &guardian);
+
+        for action in actions {
+            match action {
+                WatcherAction::RegisterWatcher(idx) => {
+                    let watcher = watcher_address(&env, idx);
+                    let _ = client.register_watcher(&admin, &watcher);
+                }
+                WatcherAction::Pause => {
+                    let _ = client.pause(&guardian);
+                }
+                WatcherAction::Unpause => {
+                    // Guardian must not be able to unpause; only admin can.
+                    let _ = client.unpause(&admin);
+                }
+                _ => {}
+            }
+
+            // Pausing must never corrupt the watcher set or admin list.
+            let count = client.get_watcher_count();
+            let watchers = client.get_watchers();
+            prop_assert_eq!(count, watchers.len());
+            prop_assert!(!client.get_admins().is_empty());
+        }
+    fn prop_watcher_info_label_within_cap_accepted(
+        label in "[a-zA-Z0-9_]{0,64}"
+    ) {
+        let (env, admin, client) = create_env_and_client();
+        let watcher = Address::generate(&env);
+        client.register_watcher(&admin, &watcher);
+
+        let label = soroban_sdk::String::from_str(&env, &label);
+        client.set_watcher_info(&admin, &watcher, &label);
+
+        let info = client.get_watcher_info(&watcher);
+        prop_assert_eq!(info.label, label);
+    }
+
+    #[test]
+    fn prop_watcher_info_label_over_cap_rejected(
+        extra in 1..64usize
+    ) {
+        let (env, admin, client) = create_env_and_client();
+        let watcher = Address::generate(&env);
+        client.register_watcher(&admin, &watcher);
+
+        let len = 64 + extra;
+        let mut buf = std::string::String::new();
+        for _ in 0..len {
+            buf.push('a');
+        }
+        let label = soroban_sdk::String::from_str(&env, &buf);
+
+        let result = client.try_set_watcher_info(&admin, &watcher, &label);
+        prop_assert_eq!(result, Err(Ok(ContractError::LabelTooLong)));
+    }
+
+    #[test]
+    fn prop_watcher_operator_within_cap_accepted(
+        operator in "[a-zA-Z0-9_]{0,64}"
+    ) {
+        let (env, admin, client) = create_env_and_client();
+        let watcher = Address::generate(&env);
+        client.register_watcher(&admin, &watcher);
+
+        let label = soroban_sdk::String::from_str(&env, "label");
+        let operator = soroban_sdk::String::from_str(&env, &operator);
+        client.set_watcher_info(&admin, &watcher, &label, &operator);
+
+        let info = client.get_watcher_info(&watcher);
+        prop_assert_eq!(info.operator, operator);
+    }
+
+    #[test]
+    fn prop_watcher_operator_over_cap_rejected(
+        extra in 1..64usize
+    ) {
+        let (env, admin, client) = create_env_and_client();
+        let watcher = Address::generate(&env);
+        client.register_watcher(&admin, &watcher);
+
+        let label = soroban_sdk::String::from_str(&env, "label");
+        let len = 64 + extra;
+        let mut buf = std::string::String::new();
+        for _ in 0..len {
+            buf.push('a');
+        }
+        let operator = soroban_sdk::String::from_str(&env, &buf);
+
+        let result = client.try_set_watcher_info(&admin, &watcher, &label, &operator);
+        prop_assert_eq!(result, Err(Ok(ContractError::OperatorTooLong)));
+    }
+
+    #[test]
+    fn prop_watcher_scope_within_cap_accepted(
+        scope in prop::collection::vec(any::<u32>(), 0..32)
+    ) {
+        let (env, admin, client) = create_env_and_client();
+        let watcher = Address::generate(&env);
+        client.register_watcher(&admin, &watcher);
+
+        let mut scopes = soroban_sdk::Vec::new(&env);
+        for s in scope.iter() {
+            scopes.push_back(*s);
+        }
+        client.set_watcher_scope(&admin, &watcher, &scopes);
+
+        let stored = client.get_watcher_scope(&watcher);
+        prop_assert_eq!(stored, scopes);
+    }
+
+    #[test]
+    fn prop_watcher_scope_over_cap_rejected(
+        extra in 1..32usize
+    ) {
+        let (env, admin, client) = create_env_and_client();
+        let watcher = Address::generate(&env);
+        client.register_watcher(&admin, &watcher);
+
+        let len = 32 + extra;
+        let mut scopes = soroban_sdk::Vec::new(&env);
+        for i in 0..len {
+            scopes.push_back(i as u32);
+        }
+
+        let result = client.try_set_watcher_scope(&admin, &watcher, &scopes);
+        prop_assert_eq!(result, Err(Ok(ContractError::ScopeTooLong)));
+    }
+
+    #[test]
+    fn prop_setters_reject_unregistered_watcher(
+        label in "[a-zA-Z0-9_]{0,64}",
+        scope in prop::collection::vec(any::<u32>(), 0..32)
+    ) {
+        let (env, admin, client) = create_env_and_client();
+        let watcher = Address::generate(&env);
+
+        let label = soroban_sdk::String::from_str(&env, &label);
+        let info_result = client.try_set_watcher_info(&admin, &watcher, &label);
+        prop_assert_eq!(info_result, Err(Ok(ContractError::WatcherNotFound)));
+
+        let mut scopes = soroban_sdk::Vec::new(&env);
+        for s in scope.iter() {
+            scopes.push_back(*s);
+        }
+        let scope_result = client.try_set_watcher_scope(&admin, &watcher, &scopes);
+        prop_assert_eq!(scope_result, Err(Ok(ContractError::WatcherNotFound)));
+    }
+
+    #[test]
+    fn prop_setters_fail_while_paused(
+        label in "[a-zA-Z0-9_]{0,64}",
+        scope in prop::collection::vec(any::<u32>(), 0..32)
+    ) {
+        let (env, admin, client) = create_env_and_client();
+        let watcher = Address::generate(&env);
+        client.register_watcher(&admin, &watcher);
+        client.pause(&admin);
+
+        let label = soroban_sdk::String::from_str(&env, &label);
+        let info_result = client.try_set_watcher_info(&admin, &watcher, &label);
+        prop_assert_eq!(info_result, Err(Ok(ContractError::ContractPaused)));
+
+        let mut scopes = soroban_sdk::Vec::new(&env);
+        for s in scope.iter() {
+            scopes.push_back(*s);
+        }
+        let scope_result = client.try_set_watcher_scope(&admin, &watcher, &scopes);
+        prop_assert_eq!(scope_result, Err(Ok(ContractError::ContractPaused)));
     }
 }
 
