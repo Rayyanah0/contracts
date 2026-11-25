@@ -107,6 +107,7 @@ jobs:
           IDENTITY: deployer
         run: |
           set -o pipefail
+          bash scripts/deploy.sh --watcher "$(stellar keys address deployer)"
           bash scripts/deploy.sh | tee "$RUNNER_TEMP/deploy.log"
 
       - name: Capture deployed contract IDs from deploy.sh output
