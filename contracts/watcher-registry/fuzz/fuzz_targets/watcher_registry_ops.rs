@@ -26,7 +26,11 @@ enum Op {
     ReplaceWatcher   { admin_idx: u8, old_idx: u8, new_idx: u8 },
     AddAdmin         { caller_idx: u8, new_admin_idx: u8 },
     RemoveAdmin      { caller_idx: u8, target_idx: u8 },
-    ClearAllWatchers { admin_idx: u8 },
+    /// Clear all watchers except a kept set of up to two pooled addresses.
+    ClearAllWatchers { admin_idx: u8, keep_a_idx: u8, keep_b_idx: u8 },
+    SetGuardian      { admin_idx: u8, guardian_idx: u8 },
+    Pause            { caller_idx: u8 },
+    Unpause          { caller_idx: u8 },
 }
 
 // ── Structured fuzz input ─────────────────────────────────────────────────────
@@ -83,8 +87,23 @@ fuzz_target!(|input: FuzzInput| {
             Op::RemoveAdmin { caller_idx, target_idx } =>
                 client.try_remove_admin(&addr(*caller_idx), &addr(*target_idx)),
 
-            Op::ClearAllWatchers { admin_idx } =>
-                client.try_clear_all_watchers(&addr(*admin_idx)),
+            Op::ClearAllWatchers { admin_idx, keep_a_idx, keep_b_idx } => {
+                // Build the kept set from the pool; duplicates collapse naturally
+                // because the contract treats the kept set as a set.
+                let mut keep: Vec<Address> = Vec::new();
+                keep.push(addr(*keep_a_idx));
+                keep.push(addr(*keep_b_idx));
+                client.try_clear_all_watchers(&addr(*admin_idx), &keep)
+            }
+
+            Op::SetGuardian { admin_idx, guardian_idx } =>
+                client.try_set_guardian(&addr(*admin_idx), &addr(*guardian_idx)),
+
+            Op::Pause { caller_idx } =>
+                client.try_pause(&addr(*caller_idx)),
+
+            Op::Unpause { caller_idx } =>
+                client.try_unpause(&addr(*caller_idx)),
         };
 
         // ── Invariant checks ─────────────────────────────────────────────────
@@ -134,6 +153,14 @@ fuzz_target!(|input: FuzzInput| {
                     "duplicate admin found at indices {i} and {j}"
                 );
             }
+        }
+
+        // 5. The guardian, if set, must be a member of the admin set.
+        if let Some(guardian) = client.get_guardian() {
+            assert!(
+                admin_vec.contains(&guardian),
+                "guardian is not a member of the admin set"
+            );
         }
     }
 });
