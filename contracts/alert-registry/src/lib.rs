@@ -199,6 +199,10 @@ pub enum DataKey {
     /// rather than an [`AlertConfig`] field, so stored configs keep their
     /// encoding.
     SnoozeUntil(u64),
+    /// Stores the list of alert IDs currently tagged with a given tag,
+    /// maintained incrementally alongside [`DataKey::AlertTags`] by every
+    /// mutator that sets or clears tags (#575).
+    TagIndex(String),
 }
 
 /// Keys of the entries in the contract's **instance** storage that are stored
@@ -2547,9 +2551,16 @@ impl AlertRegistry {
     /// Returns [`ContractError::OwnerAlertLimitExceeded`] if `new_owner` is already at the
     /// per-owner alert limit.
     /// Returns [`ContractError::Paused`] while the contract is paused.
+    ///
+    /// The recipient does not inherit the previous owner's tags, snooze, or
+    /// expiry (#576): all three are reset (tags cleared, snooze lifted,
+    /// expiry removed) as part of accepting the transfer, so the recipient
+    /// starts from the same defaults a freshly registered alert would have.
+    ///
     /// # Events
     /// Emits `(Symbol("alert"), Symbol("transfer"))` with data
-    /// `(id: u64, old_owner: Address, new_owner: Address)`.
+    /// `(version: u32, id: u64, old_owner: Address, new_owner: Address,
+    /// tags_cleared: u32, snooze_cleared: bool, expiry_cleared: bool)`.
     pub fn accept_alert_transfer(
         env: Env,
         new_owner: Address,
@@ -2588,9 +2599,32 @@ impl AlertRegistry {
         }
         Self::persist_alert(&env, config_id, &config);
 
+        // The recipient starts clean: the previous owner's tags, snooze, and
+        // expiry are not theirs to inherit silently (#576).
+        let tags_cleared = Self::clear_alert_tags(&env, config_id);
+        let snooze_cleared = env
+            .storage()
+            .persistent()
+            .has(&DataKey::SnoozeUntil(config_id));
+        env.storage()
+            .persistent()
+            .remove(&DataKey::SnoozeUntil(config_id));
+        let expiry_cleared = env.storage().persistent().has(&DataKey::AlertExpiry(config_id));
+        env.storage()
+            .persistent()
+            .remove(&DataKey::AlertExpiry(config_id));
+
         env.events().publish(
             (symbol_short!("alert"), symbol_short!("transfer")),
-            (config_id, old_owner, new_owner),
+            (
+                EVENT_SCHEMA_VERSION,
+                config_id,
+                old_owner,
+                new_owner,
+                tags_cleared,
+                snooze_cleared,
+                expiry_cleared,
+            ),
         );
         Ok(())
     }
@@ -2916,6 +2950,12 @@ impl AlertRegistry {
             seen.push_back(tag.clone());
         }
 
+        // Keep the tag -> alert-ids index (#575) in sync: drop this alert from
+        // every tag it previously had, then add it to every tag it now has.
+        Self::clear_alert_tags(&env, config_id);
+        for i in 0..tags.len() {
+            Self::add_to_tag_index(&env, &tags.get(i).unwrap(), config_id);
+        }
         config.updated_at = env.ledger().timestamp();
         config.updated_ledger = env.ledger().sequence();
 
@@ -2945,6 +2985,33 @@ impl AlertRegistry {
             .persistent()
             .get(&DataKey::AlertTags(config_id))
             .unwrap_or_else(|| vec![&env])
+    }
+
+    /// Retrieve the IDs of every alert currently tagged with `tag` (#575).
+    ///
+    /// Backed by [`DataKey::TagIndex`], maintained incrementally by
+    /// [`AlertRegistry::set_alert_tags`] (and cleared on
+    /// [`AlertRegistry::accept_alert_transfer`]), so this never has to scan
+    /// every alert. Returns an empty vec if no live alert currently has
+    /// `tag`.
+    #[must_use]
+    pub fn get_alert_ids_by_tag(env: Env, tag: String) -> Vec<u64> {
+        Self::tag_index(&env, &tag)
+    }
+
+    /// Return the rule descriptors recognized by [`AlertRegistry::validate_rule`]
+    /// (i.e. [`VALID_RULE_DESCRIPTORS`]), so clients and off-chain tooling can
+    /// read the supported list on-chain instead of hard-coding it (#578).
+    ///
+    /// Does not include the parameterized `rule:<base>:min=<amount>` form,
+    /// which is accepted for any base in the returned list.
+    #[must_use]
+    pub fn get_supported_rules(env: Env) -> Vec<String> {
+        let mut out: Vec<String> = vec![&env];
+        for descriptor in VALID_RULE_DESCRIPTORS {
+            out.push_back(String::from_str(&env, descriptor));
+        }
+        out
     }
 
     /// Snooze an alert until a given ledger sequence.
@@ -4290,6 +4357,62 @@ impl AlertRegistry {
             .remove(&DataKey::PendingTransfer(config_id));
     }
 
+    /// Alert IDs currently tagged with `tag` (#575). Empty if `tag` has never
+    /// been used or no longer tags any alert.
+    fn tag_index(env: &Env, tag: &String) -> Vec<u64> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::TagIndex(tag.clone()))
+            .unwrap_or_else(|| vec![env])
+    }
+
+    fn add_to_tag_index(env: &Env, tag: &String, config_id: u64) {
+        let mut ids = Self::tag_index(env, tag);
+        if !ids.contains(&config_id) {
+            ids.push_back(config_id);
+        }
+        let key = DataKey::TagIndex(tag.clone());
+        env.storage().persistent().set(&key, &ids);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, DEFAULT_TTL, DEFAULT_TTL);
+    }
+
+    fn remove_from_tag_index(env: &Env, tag: &String, config_id: u64) {
+        let ids = Self::tag_index(env, tag);
+        let mut kept: Vec<u64> = vec![env];
+        for i in 0..ids.len() {
+            let id = ids.get(i).unwrap();
+            if id != config_id {
+                kept.push_back(id);
+            }
+        }
+        let key = DataKey::TagIndex(tag.clone());
+        if kept.is_empty() {
+            env.storage().persistent().remove(&key);
+        } else {
+            env.storage().persistent().set(&key, &kept);
+        }
+    }
+
+    /// Clears every tag stored for `config_id`: removes the alert from each
+    /// tag's [`DataKey::TagIndex`] and deletes its [`DataKey::AlertTags`]
+    /// entry. Returns the number of tags that were cleared (#575, #576).
+    fn clear_alert_tags(env: &Env, config_id: u64) -> u32 {
+        let tags: Vec<String> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AlertTags(config_id))
+            .unwrap_or_else(|| vec![env]);
+        for i in 0..tags.len() {
+            Self::remove_from_tag_index(env, &tags.get(i).unwrap(), config_id);
+        }
+        env.storage()
+            .persistent()
+            .remove(&DataKey::AlertTags(config_id));
+        tags.len() as u32
+    }
+
     fn remove_alert_record(env: &Env, config: &AlertConfig, config_id: u64, caller: &Address) {
         Self::clear_pending_transfer(env, config_id);
         let mut tombstone = config.clone();
@@ -4845,37 +4968,59 @@ impl AlertRegistry {
 
     /// Validates a vector of rule descriptors.
     ///
-    /// Ensures at most 50 rules are supplied, each rule matches a recognized
     /// Ensures at most [`MAX_RULES_PER_ALERT`] rules are supplied (derived from
     /// [`VALID_RULE_DESCRIPTORS`]), each rule matches a recognized descriptor,
-    /// and no descriptor appears more than once.
-    /// Ensures at most 50 rules are supplied, each rule is exactly a recognized
-    /// descriptor, and no descriptor appears more than once.
+    /// and no two rules describe the same base descriptor — `rule:<base>` and
+    /// `rule:<base>:min=N` (for any `N`, including `N = 0`) are the same rule
+    /// for this check (#577).
     /// Exposed for testing, integration, and fuzz testing.
     /// # Errors
+    /// Returns [`ContractError::EmptyRules`] if `rules` is empty.
     /// Returns [`ContractError::TooManyRules`] if `rules.len()` exceeds [`MAX_RULES_PER_ALERT`].
     /// Returns [`ContractError::InvalidRuleDescriptor`] if any rule descriptor is invalid.
-    /// Returns [`ContractError::DuplicateRule`] if the same descriptor appears more than once.
+    /// Returns [`ContractError::DuplicateRule`] if two rules describe the same base descriptor.
     /// # Panics
     /// Panics if indexing into `rules` fails unexpectedly.
     pub fn validate_rules(env: &Env, rules: &Vec<String>) -> Result<(), ContractError> {
-        if rules.len() > MAX_RULES_PER_ALERT {
         if rules.is_empty() {
             return Err(ContractError::EmptyRules);
         }
-        if rules.len() > 50 {
+        if rules.len() > MAX_RULES_PER_ALERT {
             return Err(ContractError::TooManyRules);
         }
         let mut seen: Vec<String> = vec![env];
         for i in 0..rules.len() {
             let rule = rules.get(i).unwrap();
             Self::validate_rule(env, &rule)?;
-            if seen.contains(&rule) {
+            let base = Self::rule_base(env, &rule);
+            if seen.contains(&base) {
                 return Err(ContractError::DuplicateRule);
             }
-            seen.push_back(rule);
+            seen.push_back(base);
         }
         Ok(())
+    }
+
+    /// Returns the base rule descriptor for `rule`: `rule` itself if it is
+    /// exactly a recognized descriptor, or the matched base of a
+    /// `<base>:min=<amount>` parameterized rule (#394, #577).
+    ///
+    /// Assumes `rule` has already passed [`AlertRegistry::validate_rule`].
+    fn rule_base(env: &Env, rule: &String) -> String {
+        for descriptor in VALID_RULE_DESCRIPTORS {
+            if *rule == String::from_str(env, descriptor) {
+                return String::from_str(env, descriptor);
+            }
+        }
+        let len = rule.len() as usize;
+        if len <= rule_params::MAX_RULE_LEN {
+            let mut buf = [0u8; rule_params::MAX_RULE_LEN];
+            rule.copy_into_slice(&mut buf[..len]);
+            if let Some(base) = rule_params::base_descriptor(&buf[..len], &VALID_RULE_DESCRIPTORS) {
+                return String::from_str(env, base);
+            }
+        }
+        rule.clone()
     }
 }
 
