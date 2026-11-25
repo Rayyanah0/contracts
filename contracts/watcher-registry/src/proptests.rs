@@ -5,8 +5,10 @@ extern crate std;
 use std::collections::BTreeSet;
 use std::vec::Vec;
 
-use crate::{WatcherRegistry, WatcherRegistryClient, ContractError};
+use crate::{AdminAction, ContractError, WatcherRegistry, WatcherRegistryClient};
 use proptest::prelude::*;
+use proptest::test_runner::TestCaseError;
+use soroban_sdk::{testutils::Address as _, Address, Env};
 use soroban_sdk::{testutils::Address as _, Address, Env, Vec as SorobanVec};
 
 fn create_env_and_client() -> (Env, Address, WatcherRegistryClient<'static>) {
@@ -445,5 +447,181 @@ proptest! {
         }
         let scope_result = client.try_set_watcher_scope(&admin, &watcher, &scopes);
         prop_assert_eq!(scope_result, Err(Ok(ContractError::ContractPaused)));
+    }
+}
+
+#[derive(Debug, Clone)]
+enum TimelockOp {
+    SetDelay(u32),
+    ProposeAddAdmin,
+    ProposeClearAll,
+    ProposeSetDelay(u32),
+    Cancel,
+    Execute,
+    Advance(u32),
+    DirectAddAdmin,
+    DirectClearAll,
+}
+
+/// Model of the single queued action: what was proposed, when, and when it may run.
+#[derive(Debug, Clone)]
+struct ModelPending {
+    action: AdminAction,
+    proposed_at: u32,
+    ready_at: u32,
+}
+
+fn arb_timelock_op() -> impl Strategy<Value = TimelockOp> {
+    prop_oneof![
+        (0..=20u32).prop_map(TimelockOp::SetDelay),
+        Just(TimelockOp::ProposeAddAdmin),
+        Just(TimelockOp::ProposeClearAll),
+        (0..=20u32).prop_map(TimelockOp::ProposeSetDelay),
+        Just(TimelockOp::Cancel),
+        Just(TimelockOp::Execute),
+        (0..=10u32).prop_map(TimelockOp::Advance),
+        Just(TimelockOp::DirectAddAdmin),
+        Just(TimelockOp::DirectClearAll),
+    ]
+}
+
+fn propose_and_check(
+    env: &Env,
+    client: &WatcherRegistryClient<'static>,
+    admin: &Address,
+    action: AdminAction,
+    delay: u32,
+    pending: &mut Option<ModelPending>,
+) -> Result<(), TestCaseError> {
+    let had_pending = pending.is_some();
+    let res = client.try_propose_admin_action(admin, &action).unwrap();
+    if let Ok(ready_at) = res {
+        // Only one action may occupy the single pending slot.
+        prop_assert!(!had_pending, "action queued while another is pending");
+        let proposed_at = env.ledger().sequence();
+        prop_assert_eq!(ready_at, proposed_at + delay);
+        *pending = Some(ModelPending {
+            action,
+            proposed_at,
+            ready_at,
+        });
+    }
+    Ok(())
+}
+
+proptest! {
+    /// Random propose/cancel/execute/ledger-jump sequences checked against a model
+    /// of the timelock. Asserts at most one pending action, that `ready_at` is fixed
+    /// at proposal as `proposed_at + delay`, that execution waits for `ready_at`,
+    /// that the delay only rises, and that sensitive direct calls are refused once
+    /// a delay is set.
+    #[test]
+    fn prop_timelock_state_machine(ops in prop::collection::vec(arb_timelock_op(), 1..40)) {
+        let (env, admin, client) = create_env_and_client();
+        let mut delay: u32 = 0;
+        let mut pending: Option<ModelPending> = None;
+
+        for op in ops {
+            match op {
+                TimelockOp::SetDelay(d) => {
+                    let res = client.try_set_timelock_delay(&admin, &d).unwrap();
+                    if d >= delay {
+                        prop_assert_eq!(res, Ok(()));
+                        delay = d;
+                    } else {
+                        prop_assert_eq!(res, Err(ContractError::TimelockRequired));
+                    }
+                }
+                TimelockOp::ProposeAddAdmin => {
+                    let action = AdminAction::AddAdmin(Address::generate(&env));
+                    propose_and_check(&env, &client, &admin, action, delay, &mut pending)?;
+                }
+                TimelockOp::ProposeClearAll => {
+                    // No watchers are registered here, so ClearAllWatchers is always valid.
+                    propose_and_check(
+                        &env,
+                        &client,
+                        &admin,
+                        AdminAction::ClearAllWatchers,
+                        delay,
+                        &mut pending,
+                    )?;
+                }
+                TimelockOp::ProposeSetDelay(d) => {
+                    propose_and_check(
+                        &env,
+                        &client,
+                        &admin,
+                        AdminAction::SetTimelockDelay(d),
+                        delay,
+                        &mut pending,
+                    )?;
+                }
+                TimelockOp::Cancel => {
+                    let res = client.try_cancel_admin_action(&admin).unwrap();
+                    match pending.take() {
+                        Some(_) => {
+                            prop_assert_eq!(res, Ok(()));
+                        }
+                        None => {
+                            prop_assert_eq!(res, Err(ContractError::NoPendingAction));
+                        }
+                    }
+                }
+                TimelockOp::Execute => {
+                    let res = client.try_execute_admin_action(&admin).unwrap();
+                    let now = env.ledger().sequence();
+                    match pending.take() {
+                        None => {
+                            prop_assert_eq!(res, Err(ContractError::NoPendingAction));
+                        }
+                        Some(p) if now < p.ready_at => {
+                            prop_assert_eq!(res, Err(ContractError::TimelockNotExpired));
+                            pending = Some(p);
+                        }
+                        Some(p) => {
+                            prop_assert_eq!(res, Ok(()));
+                            // No sensitive action may run before the delay in effect now
+                            // has elapsed since it was proposed.
+                            prop_assert!(
+                                now >= p.proposed_at + delay,
+                                "action executed before current delay elapsed since proposal"
+                            );
+                            let new_delay = client.get_timelock_delay();
+                            prop_assert!(new_delay >= delay, "timelock delay was lowered");
+                            delay = new_delay;
+                        }
+                    }
+                }
+                TimelockOp::Advance(n) => {
+                    env.ledger().with_mut(|li| li.sequence_number += n);
+                }
+                TimelockOp::DirectAddAdmin => {
+                    // Direct calls are allowed before any delay and would change the admin
+                    // set outside the model, so only probe them once a delay is set.
+                    if delay > 0 {
+                        let res = client
+                            .try_add_admin(&admin, &Address::generate(&env))
+                            .unwrap();
+                        prop_assert_eq!(res, Err(ContractError::TimelockRequired));
+                    }
+                }
+                TimelockOp::DirectClearAll => {
+                    if delay > 0 {
+                        let res = client.try_clear_all_watchers(&admin).unwrap();
+                        prop_assert_eq!(res, Err(ContractError::TimelockRequired));
+                    }
+                }
+            }
+
+            // Contract storage must match the model after every step.
+            let stored = client.get_pending_action();
+            prop_assert_eq!(
+                stored.as_ref().map(|p| &p.action),
+                pending.as_ref().map(|p| &p.action)
+            );
+            prop_assert_eq!(stored.as_ref().map(|p| p.ready_at), pending.as_ref().map(|p| p.ready_at));
+            prop_assert_eq!(client.get_timelock_delay(), delay);
+        }
     }
 }
