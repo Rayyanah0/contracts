@@ -351,10 +351,10 @@ pub enum ContractError {
     EmptyRules = 25,
     /// Returned by `accept_admin_transfer` when the pending admin transfer is
     /// past its expiry ledger.
-    AdminTransferExpired = 24,
+    AdminTransferExpired = 34,
     /// Returned by `pause` when called by an address that is neither the
     /// admin nor the configured guardian.
-    NotAGuardian = 24,
+    NotAGuardian = 35,
     /// Returned by `confirm_webhook` when the pending webhook rotation was
     /// proposed more than [`WEBHOOK_PROPOSAL_EXPIRY_LEDGERS`] ledgers ago.
     WebhookProposalExpired = 29,
@@ -365,7 +365,7 @@ pub enum ContractError {
     RevisionMismatch = 30,
     /// Returned by `set_alert_tags` when more than [`MAX_TAGS_PER_ALERT`] tags
     /// are supplied.
-    TooManyTags = 30,
+    TooManyTags = 36,
     /// Returned by `set_alert_tags` when a tag is empty or exceeds
     /// [`MAX_TAG_LEN`] bytes.
     InvalidTag = 31,
@@ -994,7 +994,7 @@ impl AlertRegistry {
             per_contract_alert_limit: Self::get_per_contract_alert_limit(env.clone()),
             global_alert_limit: Self::get_global_alert_limit(env.clone()),
             watcher_registry: Self::get_watcher_registry(env.clone()),
-            pending_admin: Self::get_pending_admin_transfer(env),
+            pending_admin: Self::get_pending_admin_transfer(env.clone()),
             guardian: Self::get_guardian(env),
         })
     }
@@ -1067,10 +1067,6 @@ impl AlertRegistry {
             env.events()
                 .publish((symbol_short!("admin"), symbol_short!("unpause")), admin);
         }
-        env.storage().instance().set(&instance_key::PAUSED, &false);
-        Self::extend_instance_ttl(&env);
-        env.events()
-            .publish((symbol_short!("admin"), symbol_short!("unpause")), (admin,));
         Ok(())
     }
 
@@ -1362,55 +1358,6 @@ impl AlertRegistry {
     /// watcher-gating has not been enabled.
     pub fn get_watcher_registry(env: Env) -> Option<Address> {
         env.storage().instance().get(&instance_key::WATCHREG)
-    }
-
-    /// Set (or clear) the optional guardian address (admin only).
-    ///
-    /// The guardian is an on-call operator or monitoring bot that may trip the
-    /// circuit-breaker with [`AlertRegistry::pause`] but can never
-    /// [`AlertRegistry::unpause`] or perform any other admin action. This lets
-    /// a low-trust key respond to incidents without also holding the power to
-    /// upgrade the contract or change limits.
-    ///
-    /// Passing `None` clears the guardian.
-    ///
-    /// # Auth
-    /// Requires a valid Stellar auth signature from `admin`.
-    ///
-    /// # Errors
-    /// Returns [`ContractError::NotInitialized`] if the contract has not been
-    /// initialized.
-    /// Returns [`ContractError::Unauthorized`] if `admin` is not the admin.
-    /// Returns [`ContractError::Paused`] while the contract is paused.
-    ///
-    /// # Events
-    /// Emits `(Symbol("admin"), Symbol("guardian"))` with data
-    /// `(admin: Address, guardian: Option<Address>)`.
-    pub fn set_guardian(
-        env: Env,
-        admin: Address,
-        guardian: Option<Address>,
-    ) -> Result<(), ContractError> {
-        admin.require_auth();
-        Self::assert_admin(&env, &admin)?;
-        Self::assert_not_paused(&env)?;
-
-        match &guardian {
-            Some(g) => env.storage().instance().set(&instance_key::GUARDIAN, g),
-            None => env.storage().instance().remove(&instance_key::GUARDIAN),
-        }
-        Self::extend_instance_ttl(&env);
-
-        env.events().publish(
-            (symbol_short!("admin"), symbol_short!("guardian")),
-            (admin, guardian),
-        );
-        Ok(())
-    }
-
-    /// Return the configured guardian address, or `None` if none is set.
-    pub fn get_guardian(env: Env) -> Option<Address> {
-        env.storage().instance().get(&instance_key::GUARDIAN)
     }
 
     /// Set (or clear) the optional ledger at which an alert automatically

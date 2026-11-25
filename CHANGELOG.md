@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — alert-registry error-code collisions
+
+- `ContractError` codes that collided are reassigned: `AdminTransferExpired` 24 → 34, `NotAGuardian` 24 → 35, `TooManyTags` 30 → 36. `NotGuardian` keeps 24 and `RevisionMismatch` keeps 30.
 ### Added
 
 - **Alert tags.** `set_alert_tags(caller, config_id, tags)` lets the owner attach
